@@ -448,6 +448,24 @@ public final class IngestDocument {
     }
 
     /**
+     * Appends the provided value to the provided path in the document.
+     * Any non existing path element will be created.
+     * If the path identifies a list, the value will be appended to the existing list.
+     * If the path identifies a scalar, the scalar will be converted to a list and
+     * the provided value will be added to the newly created list.
+     * Supports multiple values too provided in forms of list, in that case all the values will be appended to the
+     * existing (or newly created) list.
+     * @param fieldPathTemplate Resolves to the path with dot-notation within the document
+     * @param value The value or values to append to the existing ones
+     * @param allowDuplicates When false, any values that already exist in the field will not be added
+     * @throws IllegalArgumentException if the path is null, empty or invalid.
+     */
+    public void appendFieldValue(TemplateScript.Factory fieldPathTemplate, Object value, boolean allowDuplicates) {
+        Map<String, Object> model = createTemplateModel();
+        appendFieldValue(fieldPathTemplate.newInstance(model).execute(), value, allowDuplicates);
+    }
+
+    /**
      * Sets the provided value to the provided path in the document.
      * Any non existing path element will be created.
      * If the last item in the path is a list, the value will replace the existing list as a whole.
