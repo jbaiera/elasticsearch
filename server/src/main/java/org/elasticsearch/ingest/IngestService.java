@@ -774,72 +774,120 @@ public class IngestService implements ClusterStateApplier, ReportingService<Inge
 
         @Override
         public IngestMetadata execute(IngestMetadata currentIngestMetadata, Collection<IndexMetadata> allIndexMetadata) {
-            final Map<String, PipelineConfiguration> pipelines = currentIngestMetadata == null
-                ? new HashMap<>(1)
-                : new HashMap<>(currentIngestMetadata.getPipelines());
-            final PipelineConfiguration existingPipeline = pipelines.get(request.getId());
-            final Map<String, Object> newPipelineConfig = XContentHelper.convertToMap(request.getSource(), true, request.getXContentType())
-                .v2();
-
-            if (request.getVersion() != null) {
-                if (existingPipeline == null) {
-                    throw new IllegalArgumentException(
-                        String.format(
-                            Locale.ROOT,
-                            "version conflict, required version [%s] for pipeline [%s] but no pipeline was found",
-                            request.getVersion(),
-                            request.getId()
-                        )
-                    );
-                }
-
-                final Integer currentVersion = existingPipeline.getVersion();
-                if (Objects.equals(request.getVersion(), currentVersion) == false) {
-                    throw new IllegalArgumentException(
-                        String.format(
-                            Locale.ROOT,
-                            "version conflict, required version [%s] for pipeline [%s] but current version is [%s]",
-                            request.getVersion(),
-                            request.getId(),
-                            currentVersion
-                        )
-                    );
-                }
-
-                final Integer specifiedVersion = (Integer) newPipelineConfig.get("version");
-                if (newPipelineConfig.containsKey("version") && Objects.equals(specifiedVersion, currentVersion)) {
-                    throw new IllegalArgumentException(
-                        String.format(
-                            Locale.ROOT,
-                            "cannot update pipeline [%s] with the same version [%s]",
-                            request.getId(),
-                            request.getVersion()
-                        )
-                    );
-                }
-
-                // if no version specified in the pipeline definition, inject a version of [request.getVersion() + 1]
-                if (specifiedVersion == null) {
-                    newPipelineConfig.put("version", request.getVersion() == null ? 1 : request.getVersion() + 1);
-                }
-            }
-
-            final long nowMillis = instantSource.millis();
-            if (existingPipeline == null) {
-                newPipelineConfig.put(Pipeline.CREATED_DATE_MILLIS, nowMillis);
-            } else {
-                Object existingCreatedAt = existingPipeline.getConfig().get(Pipeline.CREATED_DATE_MILLIS);
-                // only set/carry over `created_date` if existing pipeline already has it.
-                // would be confusing if existing pipelines were all updated to have `created_date` set to now.
-                if (existingCreatedAt != null) {
-                    newPipelineConfig.put(Pipeline.CREATED_DATE_MILLIS, existingCreatedAt);
-                }
-            }
-            newPipelineConfig.put(Pipeline.MODIFIED_DATE_MILLIS, nowMillis);
-
-            pipelines.put(request.getId(), new PipelineConfiguration(request.getId(), newPipelineConfig));
-            return new IngestMetadata(pipelines);
+            return clusterStateBulkUpdatePipelines(currentIngestMetadata, List.of(request), instantSource);
         }
+    }
+
+    /**
+     * Gets the pipelines from the current metadata as a new map, or creates an empty map to hold updates.
+     */
+    static Map<String, PipelineConfiguration> getPipelines(IngestMetadata currentIngestMetadata) {
+        Map<String, PipelineConfiguration> pipelines;
+        if (currentIngestMetadata != null) {
+            pipelines = new HashMap<>(currentIngestMetadata.getPipelines());
+        } else {
+            pipelines = new HashMap<>();
+        }
+        return pipelines;
+    }
+
+    /**
+     * Validates the request version against the current state of the ingest metadata, and returns the request's source data optionally
+     * modified with an incremented version number if needed.
+     * @param currentIngestMetadata current state of the ingest metadata
+     * @param request put pipeline request to validate
+     * @param instantSource provides the current time to update modify and create time fields
+     * @return source data from the give request, potentially updated with version info if needed
+     */
+    static PipelineConfiguration validatePipelineVersionAndGetSource(
+        IngestMetadata currentIngestMetadata,
+        PutPipelineRequest request,
+        InstantSource instantSource
+    ) {
+        final PipelineConfiguration existingPipeline = currentIngestMetadata == null
+            ? null
+            : currentIngestMetadata.getPipelines().get(request.getId());
+        final Map<String, Object> newPipelineConfig = XContentHelper.convertToMap(request.getSource(), true, request.getXContentType())
+            .v2();
+
+        if (request.getVersion() != null) {
+            if (existingPipeline == null) {
+                throw new IllegalArgumentException(
+                    String.format(
+                        Locale.ROOT,
+                        "version conflict, required version [%s] for pipeline [%s] but no pipeline was found",
+                        request.getVersion(),
+                        request.getId()
+                    )
+                );
+            }
+
+            final Integer currentVersion = existingPipeline.getVersion();
+            if (Objects.equals(request.getVersion(), currentVersion) == false) {
+                throw new IllegalArgumentException(
+                    String.format(
+                        Locale.ROOT,
+                        "version conflict, required version [%s] for pipeline [%s] but current version is [%s]",
+                        request.getVersion(),
+                        request.getId(),
+                        currentVersion
+                    )
+                );
+            }
+
+
+            final Integer specifiedVersion = (Integer) newPipelineConfig.get("version");
+            if (newPipelineConfig.containsKey("version") && Objects.equals(specifiedVersion, currentVersion)) {
+                throw new IllegalArgumentException(
+                    String.format(
+                        Locale.ROOT,
+                        "cannot update pipeline [%s] with the same version [%s]",
+                        request.getId(),
+                        request.getVersion()
+                    )
+                );
+            }
+
+            // if no version specified in the pipeline definition, inject a version of [request.getVersion() + 1]
+            if (specifiedVersion == null) {
+                newPipelineConfig.put("version", request.getVersion() == null ? 1 : request.getVersion() + 1);
+            }
+        }
+
+        final long nowMillis = instantSource.millis();
+        if (existingPipeline == null) {
+            newPipelineConfig.put(Pipeline.CREATED_DATE_MILLIS, nowMillis);
+        } else {
+            Object existingCreatedAt = existingPipeline.getConfig().get(Pipeline.CREATED_DATE_MILLIS);
+            // only set/carry over `created_date` if existing pipeline already has it.
+            // would be confusing if existing pipelines were all updated to have `created_date` set to now.
+            if (existingCreatedAt != null) {
+                newPipelineConfig.put(Pipeline.CREATED_DATE_MILLIS, existingCreatedAt);
+            }
+        }
+        newPipelineConfig.put(Pipeline.MODIFIED_DATE_MILLIS, nowMillis);
+
+        return new PipelineConfiguration(request.getId(), newPipelineConfig);
+    }
+
+    public static IngestMetadata clusterStateBulkUpdatePipelines(
+        IngestMetadata currentIngestMetadata,
+        List<PutPipelineRequest> requests,
+        InstantSource instantSource
+    ) {
+        if (requests.isEmpty()) {
+            return currentIngestMetadata;
+        }
+        Map<String, PipelineConfiguration> pipelines = null;
+        for (PutPipelineRequest request : requests) {
+            PipelineConfiguration pipelineSource = validatePipelineVersionAndGetSource(currentIngestMetadata, request, instantSource);
+            if (pipelines == null) {
+                // Lazily construct the pipelines map until after the first operation is validated
+                pipelines = getPipelines(currentIngestMetadata);
+            }
+            pipelines.put(request.getId(), pipelineSource);
+        }
+        return new IngestMetadata(pipelines);
     }
 
     @UpdateForV10(owner = DATA_MANAGEMENT) // Change deprecation log for special characters in name to a failure
