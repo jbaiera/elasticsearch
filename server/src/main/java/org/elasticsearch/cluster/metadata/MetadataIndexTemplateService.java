@@ -84,7 +84,53 @@ import static org.elasticsearch.cluster.metadata.MetadataCreateDataStreamService
 /**
  * Service responsible for submitting index templates updates
  */
-public class MetadataIndexTemplateService {
+public class MetadataIndexTemplateService
+    implements
+        BulkMetadataService<
+            MetadataIndexTemplateService.BulkTemplateOperation,
+            Void,
+            MetadataIndexTemplateService.InterimTemplateValidationInfo> {
+
+    public static final String BULK_METADATA_SERVICE_NAME = "elasticsearch.template";
+
+    /**
+     * A simple request holder for component template updates
+     * @param name
+     * @param template
+     * @param create
+     */
+    public record ComponentTemplateOperation(String name, ComponentTemplate template, boolean create) {}
+
+    /**
+     * A simple request holder for index template updates
+     * @param name
+     * @param template
+     * @param create
+     */
+    public record ComposableTemplateOperation(String name, ComposableIndexTemplate template, boolean create, boolean validateV2Overlaps) {}
+
+    /**
+     * A Bulk template operation that can be submitted to the metadata content service
+     */
+    public static final class BulkTemplateOperation extends BulkMetadataOperation {
+        final Map<String, ComponentTemplateOperation> componentTemplateOperations;
+        final Map<String, ComposableTemplateOperation> composableTemplateOperations;
+
+        public BulkTemplateOperation(
+            Map<String, ComponentTemplateOperation> componentTemplateOperations,
+            Map<String, ComposableTemplateOperation> composableTemplateOperations
+        ) {
+            super(BULK_METADATA_SERVICE_NAME);
+            this.componentTemplateOperations = componentTemplateOperations;
+            this.composableTemplateOperations = composableTemplateOperations;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return (componentTemplateOperations == null || componentTemplateOperations.isEmpty())
+                && (composableTemplateOperations == null || composableTemplateOperations.isEmpty());
+        }
+    }
 
     public static final String DEFAULT_TIMESTAMP_FIELD = "@timestamp";
     public static final CompressedXContent DEFAULT_TIMESTAMP_MAPPING_WITHOUT_ROUTING;
@@ -234,6 +280,11 @@ public class MetadataIndexTemplateService {
         this.instantSource = instantSource;
     }
 
+    @Override
+    public String getBulkMetadataServiceName() {
+        return BULK_METADATA_SERVICE_NAME;
+    }
+
     public void removeTemplates(
         final ProjectId projectId,
         final String templatePattern,
@@ -293,46 +344,19 @@ public class MetadataIndexTemplateService {
         );
     }
 
-    /**
-     * A simple request holder for component template updates
-     * @param name
-     * @param template
-     * @param create
-     */
-    public record ComponentTemplateOperation(String name, ComponentTemplate template, boolean create) {}
-
-    /**
-     * A simple request holder for index template updates
-     * @param name
-     * @param template
-     * @param create
-     */
-    public record ComposableTemplateOperation(String name, ComposableIndexTemplate template, boolean create, boolean validateV2Overlaps) {}
-
-    /**
-     * A name/template tuple record
-     * @param name of template
-     * @param template definition
-     */
-    private record NamedTemplateTuple(String name, ComposableIndexTemplate template) {}
-
     private ProjectMetadata processBulkTemplateUpdate(
         final ProjectMetadata currentProject,
         final Map<String, ComponentTemplateOperation> componentTemplateOperations,
         final Map<String, ComposableTemplateOperation> composableTemplateOperations
     ) throws Exception {
-        ProjectMetadata.Builder projectBuilder = ProjectMetadata.builder(currentProject);
-        var interimInfo = applyBulkTemplateUpdate(
-            currentProject,
-            componentTemplateOperations,
-            composableTemplateOperations,
-            projectBuilder
-        );
-        if (interimInfo == null) {
+        var interimInfo = applyBatch(new BulkTemplateOperation(componentTemplateOperations, composableTemplateOperations), currentProject);
+        if (interimInfo.getResult() == currentProject) {
             return currentProject;
         }
-        ProjectMetadata candidateProject = projectBuilder.build();
-        validateCandidateClusterState(currentProject, candidateProject, interimInfo);
+        ProjectMetadata candidateProject = interimInfo.getResult();
+        assert interimInfo.getContext().isPresent()
+            : "Requires context object from successful call to MetadataIndexTemplateService.applyBatch";
+        validateFinalProjectMetadata(currentProject, candidateProject, interimInfo.getContext().get());
         return candidateProject;
     }
 
@@ -350,26 +374,42 @@ public class MetadataIndexTemplateService {
         int composableTemplateOperationsCount
     ) {}
 
-    public InterimTemplateValidationInfo applyBulkTemplateUpdate(
-        final ProjectMetadata currentProject,
-        final Map<String, ComponentTemplateOperation> componentTemplateOperations,
-        final Map<String, ComposableTemplateOperation> composableTemplateOperations,
-        final ProjectMetadata.Builder projectBuilder
+    /**
+     * A name/template tuple record
+     * @param name of template
+     * @param template definition
+     */
+    private record NamedTemplateTuple(String name, ComposableIndexTemplate template) {}
+
+    @Override
+    public BulkMetadataServiceTask<BulkTemplateOperation, Void, InterimTemplateValidationInfo> createTask(
+        BulkMetadataOperation op
+    ) {
+        return new BulkMetadataServiceTask<>(this, (BulkTemplateOperation) op);
+    }
+
+    @Override
+    public BulkMetadataOperationContext<InterimTemplateValidationInfo> applyBatch(
+        final BulkTemplateOperation batch,
+        final ProjectMetadata currentProject
     ) throws Exception {
-        Map<String, ComponentTemplate> intialComponentTemplates = currentProject.componentTemplates();
+        Map<String, ComponentTemplateOperation> componentTemplateOperations = batch.componentTemplateOperations;
+        Map<String, ComposableTemplateOperation> composableTemplateOperations = batch.composableTemplateOperations;
+
+        Map<String, ComponentTemplate> initialComponentTemplates = currentProject.componentTemplates();
         Map<String, ComposableIndexTemplate> initialTemplatesV2 = currentProject.templatesV2();
 
         Map<String, ComponentTemplate> updatedComponentTemplates = new HashMap<>();
         Map<String, ComposableIndexTemplate> updatedComposableIndexTemplates = new HashMap<>();
 
         // Keep a union of current and updated composable index templates to represent the updated cluster state contents
-        Map<String, ComponentTemplate> workingComponents = new HashMap<>(intialComponentTemplates);
+        Map<String, ComponentTemplate> workingComponents = new HashMap<>(initialComponentTemplates);
         Map<String, ComposableIndexTemplate> workingTemplatesV2 = new HashMap<>(initialTemplatesV2);
 
         // Process and finalize all templates to be operated on
         for (ComponentTemplateOperation componentTemplate : componentTemplateOperations.values()) {
             final ComponentTemplate maybeFinalComponentTemplate = prepareComponentTemplate(
-                intialComponentTemplates,
+                initialComponentTemplates,
                 componentTemplate.create,
                 componentTemplate.name,
                 componentTemplate.template
@@ -395,7 +435,8 @@ public class MetadataIndexTemplateService {
         }
 
         if (updatedComponentTemplates.isEmpty() && updatedComposableIndexTemplates.isEmpty()) {
-            return null;
+            // No operations to perform
+            return BulkMetadataOperationContext.noContext(currentProject);
         }
 
         // Collect all the composable index templates that use any of the updated component template. Additionally, collect all updated
@@ -442,7 +483,6 @@ public class MetadataIndexTemplateService {
             );
         }
         // Do the same validation for the component template changes
-        // PRTODO: Is this redundant with the validateV2TemplateRequest call in the block right before here?
         for (Map.Entry<String, List<NamedTemplateTuple>> updatedComponentUsedByTemplate : updatedComponentsUsedByTemplates.entrySet()) {
             String componentTemplateName = updatedComponentUsedByTemplate.getKey();
             List<NamedTemplateTuple> composableTemplatesUsingThisComponent = updatedComponentUsedByTemplate.getValue();
@@ -452,6 +492,7 @@ public class MetadataIndexTemplateService {
         }
 
         // Sufficiently validated enough to apply changes to a candidate cluster state to complete the rest of the validation
+        ProjectMetadata.Builder projectBuilder = ProjectMetadata.builder(currentProject);
         for (Map.Entry<String, ComponentTemplate> component : updatedComponentTemplates.entrySet()) {
             projectBuilder.put(component.getKey(), component.getValue());
         }
@@ -459,36 +500,46 @@ public class MetadataIndexTemplateService {
             projectBuilder.put(indexTemplate.getKey(), indexTemplate.getValue());
         }
 
-        return new InterimTemplateValidationInfo(
-            allTemplatesRequiringValidation,
-            updatedComponentTemplates,
-            updatedComposableIndexTemplates,
-            componentTemplateOperations.size(),
-            composableTemplateOperations.size()
+        return BulkMetadataOperationContext.withContext(
+            projectBuilder.build(),
+            new InterimTemplateValidationInfo(
+                allTemplatesRequiringValidation,
+                updatedComponentTemplates,
+                updatedComposableIndexTemplates,
+                componentTemplateOperations.size(),
+                composableTemplateOperations.size()
+            )
         );
     }
 
-    public void validateCandidateClusterState(
-        ProjectMetadata currentProject,
-        ProjectMetadata candidateProject,
-        InterimTemplateValidationInfo templateInfo
-    ) throws Exception {
+
+    @Override
+    public void validateFinalProjectMetadata(
+        ProjectMetadata previousProject,
+        ProjectMetadata newProject,
+        InterimTemplateValidationInfo context
+    )
+        throws Exception {
+        if (context == null) {
+            // If there is no context, then it means there were no operations to perform, and thus no operations that require validation.
+            return;
+        }
         // Validate all changed composable index templates that have been updated, either directly or by changes to their dependencies
-        if (templateInfo.allTemplatesRequiringValidation.isEmpty() == false) {
+        if (context.allTemplatesRequiringValidation.isEmpty() == false) {
             Exception validationFailure = null;
-            for (Map.Entry<String, ComposableIndexTemplate> entry : templateInfo.allTemplatesRequiringValidation.entrySet()) {
+            for (Map.Entry<String, ComposableIndexTemplate> entry : context.allTemplatesRequiringValidation.entrySet()) {
                 final String composableTemplateName = entry.getKey();
                 final ComposableIndexTemplate composableTemplate = entry.getValue();
                 try {
                     validateIndexTemplateV2(
-                        candidateProject,
+                        newProject,
                         composableTemplateName,
                         composableTemplate
                     );
                 } catch (Exception e) {
                     // For the sake of error message backwards compatibility, do not wrap the
                     // exception if this is a single composable index template updated
-                    if (templateInfo.composableTemplateOperationsCount == 1 && templateInfo.componentTemplateOperationsCount == 0) {
+                    if (context.composableTemplateOperationsCount == 1 && context.componentTemplateOperationsCount == 0) {
                         throw e;
                     }
                     if (validationFailure == null) {
@@ -497,8 +548,8 @@ public class MetadataIndexTemplateService {
                                 + generateTemplateNamesForException(
                                     composableTemplateName,
                                     composableTemplate,
-                                    templateInfo.updatedComponentTemplates,
-                                    templateInfo.updatedComposableIndexTemplates
+                                    context.updatedComponentTemplates,
+                                    context.updatedComposableIndexTemplates
                                 )
                                 + "] results in invalid composable template ["
                                 + composableTemplateName
@@ -515,7 +566,7 @@ public class MetadataIndexTemplateService {
             }
         }
 
-        validateDataStreamsStillReferenced(candidateProject, currentProject, templateInfo.updatedComposableIndexTemplates.keySet());
+        validateDataStreamsStillReferenced(newProject, previousProject, context.updatedComposableIndexTemplates.keySet());
     }
 
     private static StringBuilder generateTemplateNamesForException(
