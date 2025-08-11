@@ -37,6 +37,8 @@ import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.ClusterStateApplier;
 import org.elasticsearch.cluster.ClusterStateTaskExecutor;
 import org.elasticsearch.cluster.ClusterStateTaskListener;
+import org.elasticsearch.cluster.metadata.BulkMetadataService;
+import org.elasticsearch.cluster.metadata.BulkMetadataServiceTask;
 import org.elasticsearch.cluster.metadata.DataStream;
 import org.elasticsearch.cluster.metadata.IndexAbstraction;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
@@ -111,15 +113,34 @@ import java.util.stream.Collectors;
 
 import static org.elasticsearch.core.Strings.format;
 import static org.elasticsearch.core.UpdateForV10.Owner.DATA_MANAGEMENT;
+import static org.elasticsearch.ingest.IngestService.BulkPipelineCreateOperation;
 
 /**
  * Holder class for several ingest related services.
  */
-public class IngestService implements ClusterStateApplier, ReportingService<IngestInfo> {
+public class IngestService
+    implements
+        ClusterStateApplier,
+        ReportingService<IngestInfo>,
+        BulkMetadataService<BulkPipelineCreateOperation, NodesInfoResponse, Void> {
 
     public static final String NOOP_PIPELINE_NAME = "_none";
 
     public static final String INGEST_ORIGIN = "ingest";
+
+    public static final String BULK_METADATA_SERVICE_NAME = "elasticsearch.ingest";
+    public static final class BulkPipelineCreateOperation extends BulkMetadataOperation {
+        final List<PutPipelineRequest> requests;
+        public BulkPipelineCreateOperation(List<PutPipelineRequest> requests) {
+            super(BULK_METADATA_SERVICE_NAME);
+            this.requests = requests;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return requests == null || requests.isEmpty();
+        }
+    }
 
     private static final Logger logger = LogManager.getLogger(IngestService.class);
     private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(IngestService.class);
@@ -334,6 +355,18 @@ public class IngestService implements ClusterStateApplier, ReportingService<Inge
         this.featureService = ingestService.featureService;
         this.samplingService = ingestService.samplingService;
         this.nodeInfoListener = ingestService.nodeInfoListener;
+    }
+
+    @Override
+    public String getBulkMetadataServiceName() {
+        return BULK_METADATA_SERVICE_NAME;
+    }
+
+    @Override
+    public BulkMetadataServiceTask<BulkPipelineCreateOperation, NodesInfoResponse, Void> createTask(
+        BulkMetadataOperation op
+    ) {
+        return new BulkMetadataServiceTask<>(this, (BulkPipelineCreateOperation) op);
     }
 
     private static Map<String, Processor.Factory> processorFactories(List<IngestPlugin> ingestPlugins, Processor.Parameters parameters) {
@@ -589,6 +622,9 @@ public class IngestService implements ClusterStateApplier, ReportingService<Inge
      */
     public void putPipeline(ProjectId projectId, PutPipelineRequest request, ActionListener<AcknowledgedResponse> listener)
         throws Exception {
+        // PRTODO: Update this to use the new mechanisms? That's more complicated than it looks - The ingest service is
+        //  crunchy about how it applies cluster state updates. It bases the updates off of only ever modifying the ingest
+        //  metadata, but our new methods work at the project metadata level in their contracts.
         if (isNoOpPipelineUpdate(state.metadata().getProject(projectId), request)) {
             // existing pipeline matches request pipeline -- no need to update
             listener.onResponse(AcknowledgedResponse.TRUE);
@@ -604,6 +640,46 @@ public class IngestService implements ClusterStateApplier, ReportingService<Inge
                 request.masterNodeTimeout()
             );
         }));
+    }
+
+    @Override
+    public BulkPipelineCreateOperation filterBatch(BulkPipelineCreateOperation batch, ProjectMetadata currentProject) {
+        // Use the view of the project metadata that is already present in the copy of the cluster state stored locally in this service.
+        // This is the most up-to-date version of the cluster state since the IngestService is an ClusterStateApplier and points to the
+        // latest cluster state, which may not be fully published yet. This maintains parity with the original way we checked for no op
+        // pipeline updates before BulkMetadataService was introduced.
+        final ProjectMetadata locallyAvailableProject = state.metadata().getProject(currentProject.id());
+        // if any of the existing pipelines match the request pipelines -- no need to update that pipeline
+        return new BulkPipelineCreateOperation(
+            batch.requests.stream().filter(request -> isNoOpPipelineUpdate(locallyAvailableProject, request) == false).toList()
+        );
+    }
+
+    @Override
+    public void collectDependencies(BulkPipelineCreateOperation batch, ActionListener<NodesInfoResponse> listener) {
+        nodeInfoListener.accept(listener);
+    }
+
+    @Override
+    public void dependencyValidation(BulkPipelineCreateOperation batch, ProjectMetadata currentProject, NodesInfoResponse nodeInfos)
+        throws Exception {
+        for (PutPipelineRequest request : batch.requests) {
+            validatePipelineRequest(currentProject.id(), request, nodeInfos);
+        }
+    }
+
+    @Override
+    public BulkMetadataOperationContext<Void> applyBatch(BulkPipelineCreateOperation batch, ProjectMetadata currentProject) {
+        IngestMetadata initialIngestMetadata = currentProject.custom(IngestMetadata.TYPE);
+        IngestMetadata finalIngestMetadata = clusterStateBulkUpdatePipelines(initialIngestMetadata, batch.requests, Instant::now);
+        if (finalIngestMetadata == initialIngestMetadata) {
+            return BulkMetadataOperationContext.noContext(currentProject);
+        } else {
+            ProjectMetadata newProject = ProjectMetadata.builder(currentProject)
+                .putCustom(IngestMetadata.TYPE, finalIngestMetadata)
+                .build();
+            return BulkMetadataOperationContext.noContext(newProject);
+        }
     }
 
     public void validatePipelineRequest(ProjectId projectId, PutPipelineRequest request, NodesInfoResponse nodeInfos) throws Exception {
