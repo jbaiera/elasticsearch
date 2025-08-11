@@ -86,6 +86,7 @@ public class ReservedLifecycleAction implements ReservedProjectStateHandler<List
 
         ClusterState state = prevState.state();
 
+        // PRTODO: Make this a bulk operation
         for (var request : requests) {
             PutLifecycleMetadataService.UpdateLifecyclePolicyTask task = new PutLifecycleMetadataService.UpdateLifecyclePolicyTask(
                 state.metadata().getProject(projectId).id(),

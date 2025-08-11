@@ -86,6 +86,7 @@ public class ReservedPipelineAction implements ReservedProjectStateHandler<List<
         ClusterState clusterState = prevState.state();
         ProjectMetadata projectMetadata = clusterState.metadata().getProject(projectId);
 
+        // PRTODO: Make this use the bulk operation
         for (var request : requests) {
             var nopUpdate = IngestService.isNoOpPipelineUpdate(projectMetadata, request);
 

@@ -152,6 +152,7 @@ public class ReservedComposableIndexTemplateAction
         var components = requests.componentTemplates;
         var composables = requests.composableTemplates;
 
+        // PRTODO: Update this to use the bulk create logic - we may want to add bulk delete logic to the services as well
         // 1. create or update component templates (composable templates depend on them)
         for (var request : components) {
             ComponentTemplate template = TransportPutComponentTemplateAction.normalizeComponentTemplate(
