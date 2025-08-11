@@ -15,9 +15,9 @@ import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.AckedClusterStateUpdateTask;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.ClusterStateAckListener;
-import org.elasticsearch.cluster.ClusterStateUpdateTask;
-import org.elasticsearch.cluster.ProjectState;
 import org.elasticsearch.cluster.SimpleBatchedAckListenerTaskExecutor;
+import org.elasticsearch.cluster.metadata.BulkMetadataService;
+import org.elasticsearch.cluster.metadata.BulkMetadataServiceTask;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.cluster.metadata.RepositoriesMetadata;
@@ -26,7 +26,6 @@ import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.cluster.service.MasterServiceTaskQueue;
 import org.elasticsearch.common.Priority;
 import org.elasticsearch.core.Nullable;
-import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.license.XPackLicenseState;
 import org.elasticsearch.reservedstate.ReservedClusterStateHandler;
@@ -37,6 +36,7 @@ import org.elasticsearch.xpack.core.ilm.IndexLifecycleMetadata;
 import org.elasticsearch.xpack.core.ilm.LifecyclePolicy;
 import org.elasticsearch.xpack.core.ilm.LifecyclePolicyMetadata;
 import org.elasticsearch.xpack.core.ilm.Phase;
+import org.elasticsearch.xpack.core.ilm.PhaseCacheManagement;
 import org.elasticsearch.xpack.core.ilm.SearchableSnapshotAction;
 import org.elasticsearch.xpack.core.ilm.WaitForSnapshotAction;
 import org.elasticsearch.xpack.core.ilm.action.PutLifecycleRequest;
@@ -44,6 +44,7 @@ import org.elasticsearch.xpack.core.slm.SnapshotLifecycleMetadata;
 import org.elasticsearch.xpack.ilm.action.ReservedLifecycleAction;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -51,12 +52,13 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 
 import static org.elasticsearch.xpack.core.ilm.LifecycleOperationMetadata.currentILMMode;
-import static org.elasticsearch.xpack.core.ilm.PhaseCacheManagement.updateIndicesForPolicy;
 import static org.elasticsearch.xpack.core.searchablesnapshots.SearchableSnapshotsConstants.SEARCHABLE_SNAPSHOT_FEATURE;
 
-public class PutLifecycleMetadataService {
+public class PutLifecycleMetadataService implements BulkMetadataService<PutLifecycleMetadataService.BulkPutLifecycleOperation, Void, Void> {
 
     private static final Logger logger = LogManager.getLogger(PutLifecycleMetadataService.class);
+
+    private static final String BULK_METADATA_SERVICE_NAME = "elasticsearch.xpack.ilm";
 
     private final ClusterService clusterService;
     private final NamedXContentRegistry xContentRegistry;
@@ -64,7 +66,7 @@ public class PutLifecycleMetadataService {
     private final XPackLicenseState licenseState;
     private final ThreadPool threadPool;
     private final ProjectResolver projectResolver;
-    private final MasterServiceTaskQueue<UpdateLifecyclePolicyTask> taskQueue;
+    private final MasterServiceTaskQueue<BulkUpdateLifecyclePolicyTask> taskQueue;
 
     public PutLifecycleMetadataService(
         ClusterService clusterService,
@@ -80,50 +82,191 @@ public class PutLifecycleMetadataService {
         this.licenseState = licenseState;
         this.threadPool = threadPool;
         this.projectResolver = projectResolver;
-        this.taskQueue = clusterService.createTaskQueue("ilm-put-lifecycle-queue", Priority.NORMAL, new IlmLifecycleExecutor());
+        this.taskQueue = clusterService.createTaskQueue(
+            "ilm-put-lifecycle-queue",
+            Priority.NORMAL,
+            new PutLifecycleMetadataService.IlmLifecycleExecutor()
+        );
     }
 
-    @SuppressForbidden(reason = "legacy usage of unbatched task") // TODO add support for batching here
-    private void submitUnbatchedTask(@SuppressWarnings("SameParameterValue") String source, ClusterStateUpdateTask task) {
-        clusterService.submitUnbatchedStateUpdateTask(source, task);
+    @Override
+    public String getBulkMetadataServiceName() {
+        return BULK_METADATA_SERVICE_NAME;
     }
 
-    public void addLifecycle(PutLifecycleRequest request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
+    @Override
+    public BulkMetadataServiceTask<BulkPutLifecycleOperation, Void, Void> createTask(
+        BulkMetadataOperation op
+    ) {
+        return new BulkMetadataServiceTask<>(this, (BulkPutLifecycleOperation) op);
+    }
+
+    public static class BulkPutLifecycleOperation extends BulkMetadataOperation {
+        final List<PutLifecycleRequest> requests;
+        final Map<String, String> filteredHeaders;
+        final boolean verboseLogging;
+
+        public BulkPutLifecycleOperation(List<PutLifecycleRequest> requests, boolean verboseLogging) {
+            this(requests, null, verboseLogging);
+        }
+
+        public BulkPutLifecycleOperation(
+            List<PutLifecycleRequest> requests,
+            Map<String, String> filteredHeaders,
+            boolean verboseLogging
+        ) {
+            super(BULK_METADATA_SERVICE_NAME);
+            this.requests = requests;
+            this.filteredHeaders = filteredHeaders;
+            this.verboseLogging = verboseLogging;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return requests == null || requests.isEmpty();
+        }
+    }
+
+    @Override
+    public void validateBatch(BulkPutLifecycleOperation batch, ProjectMetadata currentProject) {
+        for (PutLifecycleRequest request : batch.requests) {
+            LifecyclePolicy.validatePolicyName(request.getPolicy().getName());
+            request.getPolicy().maybeAddDeprecationWarningForFreezeAction(request.getPolicy().getName());
+        }
+    }
+
+    @Override
+    public BulkPutLifecycleOperation filterBatch(
+        PutLifecycleMetadataService.BulkPutLifecycleOperation batch,
+        ProjectMetadata currentProject
+    ) {
         // headers from the thread context stored by the AuthenticationService to be shared between the
         // REST layer and the Transport layer here must be accessed within this thread and not in the
         // cluster state thread in the ClusterStateUpdateTask below since that thread does not share the
         // same context, and therefore does not have access to the appropriate security headers.
-        Map<String, String> filteredHeaders = ClientHelper.getPersistableSafeSecurityHeaders(threadPool.getThreadContext(), state);
+        Map<String, String> filteredHeaders = ClientHelper.getPersistableSafeSecurityHeaders(
+            threadPool.getThreadContext(),
+            clusterService.state()
+        );
 
-        LifecyclePolicy.validatePolicyName(request.getPolicy().getName());
-        request.getPolicy().maybeAddDeprecationWarningForFreezeAction(request.getPolicy().getName());
-        ProjectMetadata projectMetadata = projectResolver.getProjectMetadata(state);
-        {
-            IndexLifecycleMetadata lifecycleMetadata = projectMetadata.custom(IndexLifecycleMetadata.TYPE, IndexLifecycleMetadata.EMPTY);
+        List<PutLifecycleRequest> filteredRequests = new ArrayList<>(batch.requests);
+        IndexLifecycleMetadata lifecycleMetadata = currentProject.custom(IndexLifecycleMetadata.TYPE, IndexLifecycleMetadata.EMPTY);
+        for (PutLifecycleRequest request : batch.requests) {
             LifecyclePolicyMetadata existingPolicy = lifecycleMetadata.getPolicyMetadatas().get(request.getPolicy().getName());
-            // Make the request a no-op if the policy and filtered headers match exactly
-            if (isNoopUpdate(existingPolicy, request.getPolicy(), filteredHeaders)) {
-                listener.onResponse(AcknowledgedResponse.TRUE);
-                return;
+            // Skip a request if it is a no-op (if the policy and filtered headers match exactly)
+            if (isNoopUpdate(existingPolicy, request.getPolicy(), filteredHeaders) == false) {
+                filteredRequests.add(request);
             }
         }
+        // Capture the filtered headers on the operation
+        return new BulkPutLifecycleOperation(filteredRequests, filteredHeaders, batch.verboseLogging);
+    }
 
-        UpdateLifecyclePolicyTask putTask = new UpdateLifecyclePolicyTask(
-            projectMetadata.id(),
-            request,
-            listener,
-            licenseState,
-            filteredHeaders,
-            xContentRegistry,
-            client
-        );
+    @Override
+    public BulkMetadataOperationContext<Void> applyBatch(
+        PutLifecycleMetadataService.BulkPutLifecycleOperation batch,
+        ProjectMetadata previousProject
+    ) {
+        return doApplyBatch(batch, previousProject, licenseState, xContentRegistry, client);
+    }
+
+    private static BulkMetadataOperationContext<Void> doApplyBatch(
+        PutLifecycleMetadataService.BulkPutLifecycleOperation batch,
+        ProjectMetadata previousProject,
+        XPackLicenseState licenseState,
+        NamedXContentRegistry xContentRegistry,
+        Client client
+    ) {
+        final IndexLifecycleMetadata currentMetadata = previousProject.custom(IndexLifecycleMetadata.TYPE, IndexLifecycleMetadata.EMPTY);
+
+        SortedMap<String, LifecyclePolicyMetadata> newPolicies = new TreeMap<>(currentMetadata.getPolicyMetadatas());
+
+        ProjectMetadata.Builder projectBuilder = null;
+        boolean updatesToPolicies = false;
+        for (PutLifecycleRequest request : batch.requests) {
+            final LifecyclePolicyMetadata existingPolicyMetadata = currentMetadata.getPolicyMetadatas().get(request.getPolicy().getName());
+
+            // Double-check for no-op in the state update task, in case it was changed/reset in the meantime
+            if (isNoopUpdate(existingPolicyMetadata, request.getPolicy(), batch.filteredHeaders)) {
+                continue;
+            }
+
+            validatePrerequisites(request.getPolicy(), previousProject, licenseState);
+            long nextVersion = (existingPolicyMetadata == null) ? 1L : existingPolicyMetadata.getVersion() + 1L;
+            LifecyclePolicyMetadata lifecyclePolicyMetadata = new LifecyclePolicyMetadata(
+                request.getPolicy(),
+                batch.filteredHeaders,
+                nextVersion,
+                Instant.now().toEpochMilli()
+            );
+            updatesToPolicies = true;
+            if (projectBuilder == null) {
+                projectBuilder = ProjectMetadata.builder(previousProject);
+            }
+            LifecyclePolicyMetadata oldPolicy = newPolicies.put(lifecyclePolicyMetadata.getName(), lifecyclePolicyMetadata);
+            if (batch.verboseLogging) {
+                if (oldPolicy == null) {
+                    logger.info("adding index lifecycle policy [{}]", request.getPolicy().getName());
+                } else {
+                    logger.info("updating index lifecycle policy [{}]", request.getPolicy().getName());
+                }
+            }
+
+            if (oldPolicy != null) {
+                // This used to have logic for if the refresh failed, but it doesn't look like it gets caught and logged earlier on,
+                // thus keeping this from ever having an issue.
+                PhaseCacheManagement.updateIndicesForPolicy(
+                    projectBuilder,
+                    previousProject,
+                    xContentRegistry,
+                    client,
+                    oldPolicy.getPolicy(),
+                    lifecyclePolicyMetadata,
+                    licenseState
+                );
+            }
+        }
+        if (updatesToPolicies) {
+            IndexLifecycleMetadata newMetadata = new IndexLifecycleMetadata(newPolicies, currentILMMode(previousProject));
+            projectBuilder.putCustom(IndexLifecycleMetadata.TYPE, newMetadata);
+            return BulkMetadataOperationContext.noContext(projectBuilder.build());
+        } else {
+            return BulkMetadataOperationContext.noContext(previousProject);
+        }
+    }
+
+    public void addLifecycle(PutLifecycleRequest request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
+        var bulkOp = new PutLifecycleMetadataService.BulkPutLifecycleOperation(List.of(request), true);
+        final ProjectId projectId = projectResolver.getProjectId();
+        ProjectMetadata projectMetadata = state.getMetadata().getProject(projectId);
+        validateBatch(bulkOp, projectMetadata);
+        var finalBulkOp = filterBatch(bulkOp, projectMetadata);
+        if (finalBulkOp.isEmpty()) {
+            return;
+        }
+        var putTask = new PutLifecycleMetadataService.BulkUpdateLifecyclePolicyTask(request, listener) {
+            @Override
+            public ClusterState execute(ClusterState currentState) throws Exception {
+                var currentMetadata = currentState.getMetadata().getProject(projectId);
+                BulkMetadataOperationContext<Void> ctx = applyBatch(finalBulkOp, currentMetadata);
+                if (ctx == null) {
+                    assert false : "PutLifecycleMetadataService returned null context from applyBatch method.";
+                    return currentState;
+                }
+                if (ctx.getResult() != currentMetadata) {
+                    return ClusterState.builder(currentState).putProjectMetadata(ctx.getResult()).build();
+                } else {
+                    return currentState;
+                }
+            }
+        };
         taskQueue.submitTask("put-lifecycle-" + request.getPolicy().getName(), putTask, putTask.timeout());
     }
 
     /**
      * Returns 'true' if the ILM policy is effectually the same (same policy and headers), and thus can be a no-op update.
      */
-    public static boolean isNoopUpdate(
+    static boolean isNoopUpdate(
         @Nullable LifecyclePolicyMetadata existingPolicy,
         LifecyclePolicy newPolicy,
         Map<String, String> filteredHeaders
@@ -140,9 +283,9 @@ public class PutLifecycleMetadataService {
      * repositories exist, and that any referenced SLM policies exist.
      *
      * @param policy The lifecycle policy
-     * @param state  The cluster state
+     * @param projectMetadata The project metadata
      */
-    private static void validatePrerequisites(LifecyclePolicy policy, ProjectState state, XPackLicenseState licenseState) {
+    private static void validatePrerequisites(LifecyclePolicy policy, ProjectMetadata projectMetadata, XPackLicenseState licenseState) {
         List<Phase> phasesWithSearchableSnapshotActions = policy.getPhases()
             .values()
             .stream()
@@ -163,7 +306,7 @@ public class PutLifecycleMetadataService {
         for (Phase phase : phasesWithSearchableSnapshotActions) {
             SearchableSnapshotAction action = (SearchableSnapshotAction) phase.getActions().get(SearchableSnapshotAction.NAME);
             String repository = action.getSnapshotRepository();
-            if (RepositoriesMetadata.get(state.cluster()).repository(repository) == null) {
+            if (RepositoriesMetadata.get(projectMetadata).repository(repository) == null) {
                 throw new IllegalArgumentException(
                     "no such repository ["
                         + repository
@@ -187,8 +330,7 @@ public class PutLifecycleMetadataService {
         for (Phase phase : phasesWithWaitForSnapshotActions) {
             WaitForSnapshotAction action = (WaitForSnapshotAction) phase.getActions().get(WaitForSnapshotAction.NAME);
             String slmPolicy = action.getPolicy();
-            if (state.metadata()
-                .custom(SnapshotLifecycleMetadata.TYPE, SnapshotLifecycleMetadata.EMPTY)
+            if (projectMetadata.custom(SnapshotLifecycleMetadata.TYPE, SnapshotLifecycleMetadata.EMPTY)
                 .getSnapshotConfigurations()
                 .get(slmPolicy) == null) {
                 throw new IllegalArgumentException(
@@ -206,6 +348,14 @@ public class PutLifecycleMetadataService {
         }
     }
 
+    private abstract static class BulkUpdateLifecyclePolicyTask extends AckedClusterStateUpdateTask {
+        protected BulkUpdateLifecyclePolicyTask(PutLifecycleRequest request, ActionListener<AcknowledgedResponse> listener) {
+            super(request, listener);
+        }
+        @Override
+        public abstract ClusterState execute(ClusterState currentState) throws Exception;
+    }
+
     public static class UpdateLifecyclePolicyTask extends AckedClusterStateUpdateTask {
         private final ProjectId projectId;
         private final PutLifecycleRequest request;
@@ -214,25 +364,6 @@ public class PutLifecycleMetadataService {
         private final NamedXContentRegistry xContentRegistry;
         private final Client client;
         private final boolean verboseLogging;
-
-        public UpdateLifecyclePolicyTask(
-            ProjectId projectId,
-            PutLifecycleRequest request,
-            ActionListener<AcknowledgedResponse> listener,
-            XPackLicenseState licenseState,
-            Map<String, String> filteredHeaders,
-            NamedXContentRegistry xContentRegistry,
-            Client client
-        ) {
-            super(request, listener);
-            this.projectId = projectId;
-            this.request = request;
-            this.licenseState = licenseState;
-            this.filteredHeaders = filteredHeaders;
-            this.xContentRegistry = xContentRegistry;
-            this.client = client;
-            this.verboseLogging = true;
-        }
 
         /**
          * Used by the {@link ReservedClusterStateHandler} for ILM
@@ -259,64 +390,29 @@ public class PutLifecycleMetadataService {
 
         @Override
         public ClusterState execute(ClusterState currentState) throws Exception {
-            var projectState = currentState.projectState(projectId);
-            final IndexLifecycleMetadata currentMetadata = projectState.metadata()
-                .custom(IndexLifecycleMetadata.TYPE, IndexLifecycleMetadata.EMPTY);
-            final LifecyclePolicyMetadata existingPolicyMetadata = currentMetadata.getPolicyMetadatas().get(request.getPolicy().getName());
-
-            // Double-check for no-op in the state update task, in case it was changed/reset in the meantime
-            if (isNoopUpdate(existingPolicyMetadata, request.getPolicy(), filteredHeaders)) {
-                return currentState;
-            }
-
-            validatePrerequisites(request.getPolicy(), projectState, licenseState);
-
-            long nextVersion = (existingPolicyMetadata == null) ? 1L : existingPolicyMetadata.getVersion() + 1L;
-            SortedMap<String, LifecyclePolicyMetadata> newPolicies = new TreeMap<>(currentMetadata.getPolicyMetadatas());
-            LifecyclePolicyMetadata lifecyclePolicyMetadata = new LifecyclePolicyMetadata(
-                request.getPolicy(),
-                filteredHeaders,
-                nextVersion,
-                Instant.now().toEpochMilli()
+            var projectMetadata = currentState.getMetadata().getProject(projectId);
+            BulkMetadataOperationContext<Void> result = doApplyBatch(
+                new PutLifecycleMetadataService.BulkPutLifecycleOperation(List.of(request), filteredHeaders, verboseLogging),
+                projectMetadata,
+                licenseState,
+                xContentRegistry,
+                client
             );
-            LifecyclePolicyMetadata oldPolicy = newPolicies.put(lifecyclePolicyMetadata.getName(), lifecyclePolicyMetadata);
-            if (verboseLogging) {
-                if (oldPolicy == null) {
-                    logger.info("adding index lifecycle policy [{}]", request.getPolicy().getName());
-                } else {
-                    logger.info("updating index lifecycle policy [{}]", request.getPolicy().getName());
-                }
-            }
-            IndexLifecycleMetadata newMetadata = new IndexLifecycleMetadata(newPolicies, currentILMMode(projectState.metadata()));
-            ProjectMetadata newProjectMetadata = ProjectMetadata.builder(projectState.metadata())
-                .putCustom(IndexLifecycleMetadata.TYPE, newMetadata)
-                .build();
-            ClusterState nonRefreshedState = ClusterState.builder(currentState).putProjectMetadata(newProjectMetadata).build();
-            if (oldPolicy == null) {
-                return nonRefreshedState;
+            if (result.getResult() != projectMetadata) {
+                return ClusterState.builder(currentState).putProjectMetadata(result.getResult()).build();
             } else {
-                try {
-                    ProjectMetadata refreshedProjectMetadata = updateIndicesForPolicy(
-                        newProjectMetadata,
-                        xContentRegistry,
-                        client,
-                        oldPolicy.getPolicy(),
-                        lifecyclePolicyMetadata,
-                        licenseState
-                    );
-                    return ClusterState.builder(currentState).putProjectMetadata(refreshedProjectMetadata).build();
-                } catch (Exception e) {
-                    logger.warn(() -> "unable to refresh indices phase JSON for updated policy [" + oldPolicy.getName() + "]", e);
-                    // Revert to the non-refreshed state
-                    return nonRefreshedState;
-                }
+                return currentState;
             }
         }
     }
 
-    private static class IlmLifecycleExecutor extends SimpleBatchedAckListenerTaskExecutor<UpdateLifecyclePolicyTask> {
+    private static class IlmLifecycleExecutor extends SimpleBatchedAckListenerTaskExecutor<
+        PutLifecycleMetadataService.BulkUpdateLifecyclePolicyTask> {
         @Override
-        public Tuple<ClusterState, ClusterStateAckListener> executeTask(UpdateLifecyclePolicyTask task, ClusterState clusterState)
+        public Tuple<ClusterState, ClusterStateAckListener> executeTask(
+            PutLifecycleMetadataService.BulkUpdateLifecyclePolicyTask task,
+            ClusterState clusterState
+        )
             throws Exception {
             return Tuple.tuple(task.execute(clusterState), task);
         }
