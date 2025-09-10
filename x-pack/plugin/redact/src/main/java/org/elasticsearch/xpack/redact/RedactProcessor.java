@@ -60,6 +60,7 @@ public class RedactProcessor extends AbstractProcessor {
     protected static final String IS_REDACTED_KEY = "_is_redacted";
     protected static final String METADATA_PATH_REDACT = IngestDocument.INGEST_KEY + "." + REDACT_KEY;
     // indicates if document has been redacted, path: _ingest._redact._is_redacted
+    // PRTODO: This is an internal field with a dotted name, may have inconsistent application based on the pipeline's access pattern
     protected static final String METADATA_PATH_REDACT_IS_REDACTED = METADATA_PATH_REDACT + "." + IS_REDACTED_KEY;
 
     private final String redactField;
@@ -227,6 +228,7 @@ public class RedactProcessor extends AbstractProcessor {
 
         // document newly redacted
         if (alreadyRedacted == false && isRedacted) {
+            // PRTODO: !!!!!
             ingestDocument.setFieldValue(METADATA_PATH_REDACT_IS_REDACTED, true);
         }
     }

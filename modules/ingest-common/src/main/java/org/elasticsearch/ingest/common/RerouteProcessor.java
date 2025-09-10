@@ -258,6 +258,9 @@ public final class RerouteProcessor extends AbstractProcessor {
                 if (fieldReference.contains("{") || fieldReference.contains("}")) {
                     throw new IllegalArgumentException("'" + value + "' is not a valid field reference");
                 }
+                // PRTODO: This field reference is provided as if it were to be executed by mustache
+                //  Users who expect application of this field path to how mustache retrieves fields
+                //  may be surprised to find that it is collected using the ingest field access pattern
                 this.fieldReference = fieldReference;
             } else {
                 this.fieldReference = null;

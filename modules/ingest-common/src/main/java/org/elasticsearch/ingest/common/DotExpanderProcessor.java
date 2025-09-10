@@ -65,6 +65,8 @@ public final class DotExpanderProcessor extends AbstractProcessor {
     }
 
     private void expandDot(IngestDocument ingestDocument, String pathToExpand, String fieldName, Map<String, Object> map) {
+        // PRTODO: Dot expansion is not going to work well with flexible mode. Imagine expanding the field "a.b.c" - if there
+        //  is not an {a: {b: {}} structure already, the processor is just going to re-add it as `a.b.c`.
         if (map.containsKey(fieldName)) {
             if (ingestDocument.hasField(pathToExpand)) {
                 Object value = map.remove(fieldName);

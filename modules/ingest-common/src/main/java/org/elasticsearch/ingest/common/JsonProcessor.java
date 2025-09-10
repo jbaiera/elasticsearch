@@ -148,6 +148,8 @@ public final class JsonProcessor extends AbstractProcessor {
         ConflictStrategy conflictStrategy,
         boolean strictJsonParsing
     ) {
+        // PRTODO: fieldName is provided by the user but we just get it from the context without using the ingest document methods
+        //  This will not support dotted field names.
         Object value = apply(ctx.get(fieldName), allowDuplicateKeys, strictJsonParsing);
         if (value instanceof Map) {
             @SuppressWarnings("unchecked")
