@@ -115,20 +115,28 @@ public class MetadataIndexTemplateService
     public static final class BulkTemplateOperation extends BulkMetadataOperation {
         final Map<String, ComponentTemplateOperation> componentTemplateOperations;
         final Map<String, ComposableTemplateOperation> composableTemplateOperations;
+        final Set<String> componentTemplateRemovals;
+        final Set<String> composableTemplateRemovals;
 
         public BulkTemplateOperation(
             Map<String, ComponentTemplateOperation> componentTemplateOperations,
-            Map<String, ComposableTemplateOperation> composableTemplateOperations
+            Map<String, ComposableTemplateOperation> composableTemplateOperations,
+            Set<String> componentTemplateRemovals,
+            Set<String> composableTemplateRemovals
         ) {
             super(BULK_METADATA_SERVICE_NAME);
             this.componentTemplateOperations = componentTemplateOperations;
             this.composableTemplateOperations = composableTemplateOperations;
+            this.componentTemplateRemovals = componentTemplateRemovals;
+            this.composableTemplateRemovals = composableTemplateRemovals;
         }
 
         @Override
         public boolean isEmpty() {
             return (componentTemplateOperations == null || componentTemplateOperations.isEmpty())
-                && (composableTemplateOperations == null || composableTemplateOperations.isEmpty());
+                && (composableTemplateOperations == null || composableTemplateOperations.isEmpty())
+                && (componentTemplateRemovals == null || componentTemplateRemovals.isEmpty())
+                && (composableTemplateRemovals == null || composableTemplateRemovals.isEmpty());
         }
     }
 
@@ -344,20 +352,32 @@ public class MetadataIndexTemplateService
         );
     }
 
-    private ProjectMetadata processBulkTemplateUpdate(
+    private record BulkApplyResult(ProjectMetadata project, Optional<InterimTemplateValidationInfo> info) {}
+
+    private BulkApplyResult processBulkTemplateUpdate(
         final ProjectMetadata currentProject,
         final Map<String, ComponentTemplateOperation> componentTemplateOperations,
-        final Map<String, ComposableTemplateOperation> composableTemplateOperations
+        final Map<String, ComposableTemplateOperation> composableTemplateOperations,
+        final Set<String> componentTemplateRemovals,
+        final Set<String> composableTemplateRemovals
     ) throws Exception {
-        var interimInfo = applyBatch(new BulkTemplateOperation(componentTemplateOperations, composableTemplateOperations), currentProject);
+        var interimInfo = applyBatch(
+            new BulkTemplateOperation(
+                componentTemplateOperations,
+                composableTemplateOperations,
+                componentTemplateRemovals,
+                composableTemplateRemovals
+            ),
+            currentProject
+        );
         if (interimInfo.getResult() == currentProject) {
-            return currentProject;
+            return new BulkApplyResult(currentProject, interimInfo.getContext());
         }
         ProjectMetadata candidateProject = interimInfo.getResult();
         assert interimInfo.getContext().isPresent()
             : "Requires context object from successful call to MetadataIndexTemplateService.applyBatch";
         validateFinalProjectMetadata(currentProject, candidateProject, interimInfo.getContext().get());
-        return candidateProject;
+        return new BulkApplyResult(candidateProject, interimInfo.getContext());
     }
 
     /**
@@ -370,8 +390,12 @@ public class MetadataIndexTemplateService
         Map<String, ComposableIndexTemplate> allTemplatesRequiringValidation,
         Map<String, ComponentTemplate> updatedComponentTemplates,
         Map<String, ComposableIndexTemplate> updatedComposableIndexTemplates,
+        Set<String> removedComponentTemplates,
+        Set<String> removedComposableTemplates,
         int componentTemplateOperationsCount,
-        int composableTemplateOperationsCount
+        int composableTemplateOperationsCount,
+        int componentTemplateRemovalOperationsCount,
+        int composableTemplateRemovalOperationsCount
     ) {}
 
     /**
@@ -393,20 +417,30 @@ public class MetadataIndexTemplateService
         final BulkTemplateOperation batch,
         final ProjectMetadata currentProject
     ) throws Exception {
+        // Update operations
         Map<String, ComponentTemplateOperation> componentTemplateOperations = batch.componentTemplateOperations;
         Map<String, ComposableTemplateOperation> composableTemplateOperations = batch.composableTemplateOperations;
 
+        // Removal operations
+        Set<String> componentTemplateRemovalOperations = batch.componentTemplateRemovals;
+        Set<String> composableTemplateRemovalOperations = batch.composableTemplateRemovals;
+
+        // Initial state before updates
         Map<String, ComponentTemplate> initialComponentTemplates = currentProject.componentTemplates();
         Map<String, ComposableIndexTemplate> initialTemplatesV2 = currentProject.templatesV2();
 
+        // Collections to track all performed operations
         Map<String, ComponentTemplate> updatedComponentTemplates = new HashMap<>();
-        Map<String, ComposableIndexTemplate> updatedComposableIndexTemplates = new HashMap<>();
+        Set<String> removedComponentTemplates = HashSet.newHashSet(componentTemplateRemovalOperations.size());
 
-        // Keep a union of current and updated composable index templates to represent the updated cluster state contents
+        Map<String, ComposableIndexTemplate> updatedComposableIndexTemplates = new HashMap<>();
+        Set<String> removedComposableIndexTemplates = HashSet.newHashSet(composableTemplateRemovalOperations.size());
+
+        // The mutable state of the system that we will modify and capture at the end of the batch
         Map<String, ComponentTemplate> workingComponents = new HashMap<>(initialComponentTemplates);
         Map<String, ComposableIndexTemplate> workingTemplatesV2 = new HashMap<>(initialTemplatesV2);
 
-        // Process and finalize all templates to be operated on
+        // Process and finalize all component template updates
         for (ComponentTemplateOperation componentTemplate : componentTemplateOperations.values()) {
             final ComponentTemplate maybeFinalComponentTemplate = prepareComponentTemplate(
                 initialComponentTemplates,
@@ -420,6 +454,7 @@ public class MetadataIndexTemplateService
             }
         }
 
+        // Process and finalize all composable index template updates
         for (ComposableTemplateOperation composableIndexTemplate : composableTemplateOperations.values()) {
             final ComposableIndexTemplate maybeFinalComposableTemplate = prepareComposableTemplate(
                 currentProject,
@@ -434,22 +469,122 @@ public class MetadataIndexTemplateService
             }
         }
 
-        if (updatedComponentTemplates.isEmpty() && updatedComposableIndexTemplates.isEmpty()) {
-            // No operations to perform
+        // Process any composable index template removals from the working state
+        if (composableTemplateRemovalOperations.isEmpty() == false) {
+            if (composableTemplateRemovalOperations.size() > 1) {
+                Set<String> missingNames = null;
+                for (String name : composableTemplateRemovalOperations) {
+                    if (workingTemplatesV2.containsKey(name)) {
+                        workingTemplatesV2.remove(name);
+                        updatedComposableIndexTemplates.remove(name);
+                        removedComposableIndexTemplates.add(name);
+                    } else {
+                        // multiple wildcards are not supported, so if a name with a wildcard is specified then
+                        // the else clause gets executed, because template names can't contain a wildcard.
+                        if (missingNames == null) {
+                            missingNames = new LinkedHashSet<>();
+                        }
+                        missingNames.add(name);
+                    }
+                }
+
+                if (missingNames != null) {
+                    throw new IndexTemplateMissingException(String.join(",", missingNames));
+                }
+            } else {
+                final String name = composableTemplateRemovalOperations.iterator().next();
+                for (String templateName : workingTemplatesV2.keySet()) {
+                    if (Regex.simpleMatch(name, templateName)) {
+                        workingTemplatesV2.remove(templateName);
+                        updatedComposableIndexTemplates.remove(name);
+                        removedComposableIndexTemplates.add(templateName);
+                    }
+                }
+                if (removedComposableIndexTemplates.isEmpty()) {
+                    // if it's a match all pattern, and no templates are found (we have none), don't
+                    // fail with index missing...
+                    if (Regex.isMatchAllPattern(name) != true) {
+                        throw new IndexTemplateMissingException(name);
+                    }
+                }
+            }
+        }
+
+        // Process any component template removals from the working state
+        if (componentTemplateRemovalOperations.isEmpty() == false) {
+            if (componentTemplateRemovalOperations.size() > 1) {
+                Set<String> missingNames = null;
+                for (String name : componentTemplateRemovalOperations) {
+                    if (workingComponents.containsKey(name)) {
+                        workingComponents.remove(name);
+                        updatedComponentTemplates.remove(name);
+                        removedComponentTemplates.add(name);
+                    } else {
+                        // multiple wildcards are not supported, so if a name with a wildcard is specified then
+                        // the else clause gets executed, because template names can't contain a wildcard.
+                        if (missingNames == null) {
+                            missingNames = new LinkedHashSet<>();
+                        }
+                        missingNames.add(name);
+                    }
+                }
+
+                if (missingNames != null) {
+                    throw new ResourceNotFoundException(String.join(",", missingNames));
+                }
+            } else {
+                final String name = componentTemplateRemovalOperations.iterator().next();
+                for (String templateName : workingComponents.keySet()) {
+                    if (Regex.simpleMatch(name, templateName)) {
+                        workingComponents.remove(templateName);
+                        updatedComponentTemplates.remove(name);
+                        removedComponentTemplates.add(templateName);
+                    }
+                }
+                if (removedComponentTemplates.isEmpty()) {
+                    // if it's a match all pattern, and no templates are found (we have none), don't
+                    // fail with index missing...
+                    if (Regex.isMatchAllPattern(name) != true) {
+                        throw new ResourceNotFoundException(name);
+                    }
+                }
+            }
+        }
+
+        // Before continuing with all this validation, do we actually have anything that needed doing?
+        if (updatedComponentTemplates.isEmpty()
+            && updatedComposableIndexTemplates.isEmpty()
+            && removedComponentTemplates.isEmpty()
+            && removedComposableIndexTemplates.isEmpty()) {
+            // No operations to perform, early out
             return BulkMetadataOperationContext.noContext(currentProject);
         }
 
-        // Collect all the composable index templates that use any of the updated component template. Additionally, collect all updated
-        // component templates that were used by any index template. We'll use both of these for validating that both sets of templates
-        // are (still) valid after updating.
+        // Post update validations:
+        // 1. Collect all the composable templates that now need to be validated because either
+        //   A. The template changed
+        //   B. The template depends on a component that changed
+        //   C. The template depends on an optional component that was removed
+        // 2. Component templates that are required cannot be removed
+        // 3. Each changed template must not set indices to hidden if it is a global template
+        // 4. Each changed component template must also not set indices to hidden if it is a global template
+        // 5. All affected composable index templates must form valid template definitions when combined with their components
+        // 6. All data streams must continue pointing to a valid template definition if they did so before the operation.
+
+        // 1. Collect all the composable templates that now need to be validated because they changed or their dependencies changed
         final Map<String, ComposableIndexTemplate> allTemplatesRequiringValidation = new HashMap<>();
         final Map<String, List<NamedTemplateTuple>> updatedComponentsUsedByTemplates = new HashMap<>();
+        final Set<String> requiredComponentsRemoved = new HashSet<>();
+        final Set<String> templatesRequiringRemovedComponents = new HashSet<>();
         for (Map.Entry<String, ComposableIndexTemplate> workingTemplateV2 : workingTemplatesV2.entrySet()) {
             String indexTemplateName = workingTemplateV2.getKey();
             ComposableIndexTemplate indexTemplateDefinition = workingTemplateV2.getValue();
+            // Lazily create the required components for this template when we need to check them
+            HashSet<String> requiredComponents = null;
             boolean usesUpdatedComponents = false;
+            boolean usesRemovedComponents = false;
 
-            // Check each component dependency to see if it was updated during this bulk operation
+            // Check each component dependency to see if it was updated or removed during this bulk operation
             for (String component : indexTemplateDefinition.composedOf()) {
                 if (updatedComponentTemplates.containsKey(component)) {
                     usesUpdatedComponents = true;
@@ -460,29 +595,53 @@ public class MetadataIndexTemplateService
                         return values;
                     });
                 }
+                if (removedComponentTemplates.contains(component)) {
+                    // Template would also need validating if an optional component it uses is removed.
+                    usesRemovedComponents = true;
+
+                    // 2. Component templates that are required cannot be removed
+                    requiredComponents = requiredComponents == null
+                        ? new HashSet<>(indexTemplateDefinition.getRequiredComponentTemplates())
+                        : requiredComponents;
+                    if (requiredComponents.contains(component)) {
+                        requiredComponentsRemoved.add(component);
+                        templatesRequiringRemovedComponents.add(indexTemplateName);
+                    }
+                }
             }
 
             // Capture all index templates that need to validate their composition
-            if (usesUpdatedComponents || updatedComposableIndexTemplates.containsKey(indexTemplateName)) {
+            if (usesUpdatedComponents || usesRemovedComponents || updatedComposableIndexTemplates.containsKey(indexTemplateName)) {
                 allTemplatesRequiringValidation.put(indexTemplateName, indexTemplateDefinition);
             }
         }
 
-        // Validate all the templates to make sure they aren't adding hidden index settings to global patterns
+        // 2. (continued) Component templates that are required cannot be removed
+        if (requiredComponentsRemoved.isEmpty() != true) {
+            throw new IllegalArgumentException(
+                "component templates "
+                    + requiredComponentsRemoved
+                    + " cannot be removed as they are still in use by index templates "
+                    + templatesRequiringRemovedComponents
+            );
+        }
+
+        // 3. Each changed template must not set indices to hidden if it is a global template
         for (Map.Entry<String, ComposableIndexTemplate> updatedComposableIndexTemplate : updatedComposableIndexTemplates.entrySet()) {
             String indexTemplateName = updatedComposableIndexTemplate.getKey();
             ComposableIndexTemplate composableIndexTemplate = updatedComposableIndexTemplate.getValue();
             boolean validateV2Overlaps = composableTemplateOperations.get(indexTemplateName).validateV2Overlaps();
 
-            MetadataIndexTemplateService.validateV2TemplateRequest(workingComponents, indexTemplateName, composableIndexTemplate);
-            MetadataIndexTemplateService.v2TemplateOverlaps(
+            validateV2TemplateRequest(workingComponents, indexTemplateName, composableIndexTemplate);
+            v2TemplateOverlaps(
                 workingTemplatesV2,
                 indexTemplateName,
                 composableIndexTemplate,
                 validateV2Overlaps
             );
         }
-        // Do the same validation for the component template changes
+
+        // 4. Each changed component template must also not set indices to hidden if it is a global template
         for (Map.Entry<String, List<NamedTemplateTuple>> updatedComponentUsedByTemplate : updatedComponentsUsedByTemplates.entrySet()) {
             String componentTemplateName = updatedComponentUsedByTemplate.getKey();
             List<NamedTemplateTuple> composableTemplatesUsingThisComponent = updatedComponentUsedByTemplate.getValue();
@@ -492,12 +651,19 @@ public class MetadataIndexTemplateService
         }
 
         // Sufficiently validated enough to apply changes to a candidate cluster state to complete the rest of the validation
+        // in the validateFinalProjectMetadata method
         ProjectMetadata.Builder projectBuilder = ProjectMetadata.builder(currentProject);
         for (Map.Entry<String, ComponentTemplate> component : updatedComponentTemplates.entrySet()) {
             projectBuilder.put(component.getKey(), component.getValue());
         }
         for (Map.Entry<String, ComposableIndexTemplate> indexTemplate : updatedComposableIndexTemplates.entrySet()) {
             projectBuilder.put(indexTemplate.getKey(), indexTemplate.getValue());
+        }
+        for (String component : removedComponentTemplates) {
+            projectBuilder.removeComponentTemplate(component);
+        }
+        for (String indexTemplate : removedComposableIndexTemplates) {
+            projectBuilder.removeIndexTemplate(indexTemplate);
         }
 
         return BulkMetadataOperationContext.withContext(
@@ -506,8 +672,12 @@ public class MetadataIndexTemplateService
                 allTemplatesRequiringValidation,
                 updatedComponentTemplates,
                 updatedComposableIndexTemplates,
+                removedComponentTemplates,
+                removedComposableIndexTemplates,
                 componentTemplateOperations.size(),
-                composableTemplateOperations.size()
+                composableTemplateOperations.size(),
+                componentTemplateRemovalOperations.size(),
+                composableTemplateRemovalOperations.size()
             )
         );
     }
@@ -524,7 +694,8 @@ public class MetadataIndexTemplateService
             // If there is no context, then it means there were no operations to perform, and thus no operations that require validation.
             return;
         }
-        // Validate all changed composable index templates that have been updated, either directly or by changes to their dependencies
+
+        // 5. All affected composable index templates must form valid template definitions when combined with their components
         if (context.allTemplatesRequiringValidation.isEmpty() == false) {
             Exception validationFailure = null;
             for (Map.Entry<String, ComposableIndexTemplate> entry : context.allTemplatesRequiringValidation.entrySet()) {
@@ -566,7 +737,13 @@ public class MetadataIndexTemplateService
             }
         }
 
-        validateDataStreamsStillReferenced(newProject, previousProject, context.updatedComposableIndexTemplates.keySet());
+        // 6. All data streams must continue pointing to a valid template definition if they did so before the operation.
+        validateDataStreamsStillReferenced(
+            newProject,
+            previousProject,
+            context.updatedComposableIndexTemplates.keySet(),
+            context.removedComposableTemplates
+        );
     }
 
     private static StringBuilder generateTemplateNamesForException(
@@ -647,7 +824,7 @@ public class MetadataIndexTemplateService
         }
 
         CompressedXContent mappings = template.template().mappings();
-        CompressedXContent wrappedMappings = MetadataIndexTemplateService.wrapMappingsIfNecessary(mappings, xContentRegistry);
+        CompressedXContent wrappedMappings = wrapMappingsIfNecessary(mappings, xContentRegistry);
 
         // We may need to normalize index settings, so do that also
         Settings finalSettings = template.template().settings();
@@ -714,7 +891,7 @@ public class MetadataIndexTemplateService
             throw new IllegalArgumentException("index template [" + name + "] already exists");
         }
 
-        Map<String, List<String>> overlaps = MetadataIndexTemplateService.findConflictingV1Templates(
+        Map<String, List<String>> overlaps = findConflictingV1Templates(
             previousProject,
             name,
             template.indexPatterns()
@@ -746,7 +923,7 @@ public class MetadataIndexTemplateService
             // If an inner template was specified, its mappings may need to be
             // adjusted (to add _doc) and it should be validated
             final CompressedXContent mappings = innerTemplate.mappings();
-            final CompressedXContent wrappedMappings = MetadataIndexTemplateService.wrapMappingsIfNecessary(mappings, xContentRegistry);
+            final CompressedXContent wrappedMappings = wrapMappingsIfNecessary(mappings, xContentRegistry);
             final Template finalTemplate = Template.builder(innerTemplate).settings(finalSettings).mappings(wrappedMappings).build();
             finalIndexTemplateBuilder.template(finalTemplate);
         }
@@ -783,8 +960,10 @@ public class MetadataIndexTemplateService
         ProjectMetadata newProject = processBulkTemplateUpdate(
             currentProject,
             Map.of(name, new ComponentTemplateOperation(name, template, create)),
-            Map.of()
-        );
+            Map.of(),
+            Set.of(),
+            Set.of()
+        ).project;
         logger.info(
             "{} component template [{}]",
             currentProject.componentTemplates().containsKey(name) ? "updating" : "adding",
@@ -837,12 +1016,12 @@ public class MetadataIndexTemplateService
         final ProjectMetadata project,
         final ActionListener<AcknowledgedResponse> listener
     ) {
-        validateCanBeRemoved(project, names);
+        validateCanBeRemoved(project.componentTemplates(), project.templatesV2(), names);
         taskQueue.submitTask(
             "remove-component-template [" + String.join(",", names) + "]",
             new TemplateClusterStateUpdateTask(listener, project.id()) {
                 @Override
-                public ProjectMetadata execute(ProjectMetadata currentProject) {
+                public ProjectMetadata execute(ProjectMetadata currentProject) throws Exception {
                     return innerRemoveComponentTemplate(currentProject, names);
                 }
             },
@@ -851,49 +1030,20 @@ public class MetadataIndexTemplateService
     }
 
     // Exposed for ReservedComponentTemplateAction
-    public static ProjectMetadata innerRemoveComponentTemplate(ProjectMetadata project, String... names) {
-        validateCanBeRemoved(project, names);
-
-        final Set<String> templateNames = new HashSet<>();
-        if (names.length > 1) {
-            Set<String> missingNames = null;
-            for (String name : names) {
-                if (project.componentTemplates().containsKey(name)) {
-                    templateNames.add(name);
-                } else {
-                    // wildcards are not supported, so if a name with a wildcard is specified then
-                    // the else clause gets executed, because template names can't contain a wildcard.
-                    if (missingNames == null) {
-                        missingNames = new LinkedHashSet<>();
-                    }
-                    missingNames.add(name);
-                }
+    public ProjectMetadata innerRemoveComponentTemplate(ProjectMetadata project, String... names) throws Exception {
+        BulkApplyResult result = processBulkTemplateUpdate(
+            project,
+            Map.of(),
+            Map.of(),
+            Set.of(names),
+            Set.of()
+        );
+        result.info.ifPresent(info -> {
+            for (String templateName : info.removedComponentTemplates) {
+                logger.info("removing component template [{}]", templateName);
             }
-
-            if (missingNames != null) {
-                throw new ResourceNotFoundException(String.join(",", missingNames));
-            }
-        } else {
-            for (String templateName : project.componentTemplates().keySet()) {
-                if (Regex.simpleMatch(names[0], templateName)) {
-                    templateNames.add(templateName);
-                }
-            }
-            if (templateNames.isEmpty()) {
-                // if its a match all pattern, and no templates are found (we have none), don't
-                // fail with index missing...
-                if (Regex.isMatchAllPattern(names[0])) {
-                    return project;
-                }
-                throw new ResourceNotFoundException(names[0]);
-            }
-        }
-        ProjectMetadata.Builder builder = ProjectMetadata.builder(project);
-        for (String templateName : templateNames) {
-            logger.info("removing component template [{}]", templateName);
-            builder.removeComponentTemplate(templateName);
-        }
-        return builder.build();
+        });
+        return result.project;
     }
 
     /**
@@ -901,20 +1051,25 @@ public class MetadataIndexTemplateService
      * A component template should not be removed if it is <b>required</b> by any index templates,
      * that is- it is used AND NOT specified as {@code ignore_missing_component_templates}.
      */
-    static void validateCanBeRemoved(ProjectMetadata project, String... templateNameOrWildcard) {
+    static void validateCanBeRemoved(
+        Map<String, ComponentTemplate> componentTemplates,
+        Map<String, ComposableIndexTemplate> templatesV2,
+        String... templateNameOrWildcard
+    ) {
         final Predicate<String> predicate;
         if (templateNameOrWildcard.length > 1) {
-            predicate = name -> Arrays.asList(templateNameOrWildcard).contains(name);
+            var templateNameList = Arrays.asList(templateNameOrWildcard);
+            predicate = templateNameList::contains;
         } else {
             predicate = name -> Regex.simpleMatch(templateNameOrWildcard[0], name);
         }
-        final Set<String> matchingComponentTemplates = project.componentTemplates()
+        final Set<String> matchingComponentTemplates = componentTemplates
             .keySet()
             .stream()
             .filter(predicate)
             .collect(Collectors.toSet());
         final Set<String> componentsBeingUsed = new HashSet<>();
-        final List<String> templatesStillUsing = project.templatesV2().entrySet().stream().filter(e -> {
+        final List<String> templatesStillUsing = templatesV2.entrySet().stream().filter(e -> {
             Set<String> intersecting = Sets.intersection(
                 new HashSet<>(e.getValue().getRequiredComponentTemplates()),
                 matchingComponentTemplates
@@ -1037,8 +1192,10 @@ public class MetadataIndexTemplateService
         ProjectMetadata newProject = processBulkTemplateUpdate(
             project,
             Map.of(),
-            Map.of(name, new ComposableTemplateOperation(name, template, create, validateV2Overlaps))
-        );
+            Map.of(name, new ComposableTemplateOperation(name, template, create, validateV2Overlaps)),
+            Set.of(),
+            Set.of()
+        ).project;
         logger.info(
             "{} index template [{}] for index patterns {}",
             project.templatesV2().containsKey(name) ? "updating" : "adding",
@@ -1267,7 +1424,8 @@ public class MetadataIndexTemplateService
     public static void validateDataStreamsStillReferenced(
         ProjectMetadata candidateProject,
         ProjectMetadata previousProject,
-        Set<String> updatedIndexTemplateNames
+        Set<String> updatedIndexTemplateNames,
+        Set<String> removedIndexTemplateNames
     ) {
         if (updatedIndexTemplateNames.isEmpty()) {
             // Nothing to validate
@@ -1280,6 +1438,7 @@ public class MetadataIndexTemplateService
             .map(Map.Entry::getKey)
             .collect(Collectors.toSet());
         final Map<String, Set<String>> offendingTemplateToUnreferencedDataStreams = new HashMap<>();
+        final Map<String, Set<String>> removedTemplateToUnreferencedDataStreams = new HashMap<>();
         final Set<String> unreferencedDataStreamsWithoutTemplateChange = new HashSet<>();
         // For each data stream that we have, see whether it's covered by a different
         // template (which is great), or whether it's now uncovered by any template
@@ -1289,8 +1448,8 @@ public class MetadataIndexTemplateService
             if (originallyMatchingTemplates == null) {
                 unreferenced = true;
             } else {
-                // We found a template that still matches, great! Buuuuttt... check whether it
-                // is a data stream template, as it's only useful if it has a data stream definition
+                // We found a template that matched, great! Buuuuttt... check whether it
+                // was a data stream template, as it's only useful if it had a data stream definition
                 if (previousProject.templatesV2().get(originallyMatchingTemplates.getFirst()).getDataStreamTemplate() == null) {
                     unreferenced = true;
                 }
@@ -1311,6 +1470,11 @@ public class MetadataIndexTemplateService
                         originalTemplate,
                         (k) -> new HashSet<>()
                     ).add(dataStream);
+                } else if (removedIndexTemplateNames.contains(originalTemplate)) {
+                    removedTemplateToUnreferencedDataStreams.computeIfAbsent(
+                        originalTemplate,
+                        (k) -> new HashSet<>()
+                    ).add(dataStream);
                 } else {
                     // Not sure how this could happen. Somehow we had a template in the last version that matched, but now we don't,
                     // and it wasn't one that changed. Assert on it and collect for graceful degradation.
@@ -1322,42 +1486,78 @@ public class MetadataIndexTemplateService
                             + originalTemplate
                             + "] but it was not a template that changed during the cluster state operation. Changed templates ["
                             + updatedIndexTemplateNames
+                            + "], Removed templates ["
+                            + removedIndexTemplateNames
                             + "]";
                 }
             } else {
                 // A template still matches, but again - check if it is a data stream template
                 String newTemplate = newlyMatchingTemplates.getFirst();
                 if (candidateProject.templatesV2().get(newTemplate).getDataStreamTemplate() == null) {
-                    // Template is not a data stream template. Could be because
+                    // Template is not a data stream template. Could be because the original changed or deleted or
+                    // a different one was added at higher a priority.
+                    boolean sameTemplateName = newTemplate.equals(originalTemplate);
                     boolean newTemplateWasUpdated = updatedIndexTemplateNames.contains(newTemplate);
                     boolean oldTemplateWasUpdated = updatedIndexTemplateNames.contains(originalTemplate);
+                    boolean oldTemplateWasRemoved = removedIndexTemplateNames.contains(originalTemplate);
+
                     // Ok so this data stream is in an invalid state. Figure out which template change caused this.
-                    if (newTemplateWasUpdated && oldTemplateWasUpdated) {
-                        // Ok both templates changed, but we don't know if both changes are responsible for why the data stream broke.
-                        // What causes a template to be the reason for breaking? Patterns, priority, and template changes.
-                        // Does it matter? We're going to reject both operations. Just label both of them as the cause of the problem.
-                        offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
-                            newTemplate,
-                            (k) -> new HashSet<>()
-                        ).add(dataStream);
-                        offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
-                            originalTemplate,
-                            (k) -> new HashSet<>()
-                        ).add(dataStream);
-                    } else if (newTemplateWasUpdated) {
-                        // A new template was inserted ahead of the old one, and it is not a data stream template
-                        // Just the new one is the problem
-                        offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
-                            newTemplate,
-                            (k) -> new HashSet<>()
-                        ).add(dataStream);
+                    if (sameTemplateName) {
+                        if (oldTemplateWasUpdated) {
+                            // The template has changed to be incompatible.
+                            offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
+                                newTemplate,
+                                (k) -> new HashSet<>()
+                            ).add(dataStream);
+                        }
                     } else {
-                        // Old template was changed and the new template (unchanged) is now incorrectly applied
-                        // The old one changing is the problem
-                        offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
-                            originalTemplate,
-                            (k) -> new HashSet<>()
-                        ).add(dataStream);
+                        if (newTemplateWasUpdated && oldTemplateWasUpdated) {
+                            // Ok both templates changed, but we don't know if both changes are responsible for why the data stream broke.
+                            // What causes a template to be the reason for breaking? Patterns, priority, and template changes.
+                            // Does it matter? We're going to reject both operations. Just label both of them as the cause of the problem.
+                            // PRTODO: Is there actually nothing we can do here? Is both templates changed, one could be technically
+                            //  more at fault than the other
+                            offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
+                                newTemplate,
+                                (k) -> new HashSet<>()
+                            ).add(dataStream);
+                            offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
+                                originalTemplate,
+                                (k) -> new HashSet<>()
+                            ).add(dataStream);
+                        } else if (newTemplateWasUpdated && oldTemplateWasRemoved) {
+                            // A new template was added/updated, and the old template was removed. Which one is more the cause of the
+                            // problem? See above. We don't know. We can guess on the details, but either change could share the blame.
+                            offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
+                                newTemplate,
+                                (k) -> new HashSet<>()
+                            ).add(dataStream);
+                            removedTemplateToUnreferencedDataStreams.computeIfAbsent(
+                                originalTemplate,
+                                (k) -> new HashSet<>()
+                            ).add(dataStream);
+                        } else if (newTemplateWasUpdated) {
+                            // A new template was inserted ahead of the old one, and it is not a data stream template
+                            // Just the new one is the problem
+                            offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
+                                newTemplate,
+                                (k) -> new HashSet<>()
+                            ).add(dataStream);
+                        } else if (oldTemplateWasUpdated) {
+                            // Old template was changed and the new template (unchanged) is now incorrectly applied
+                            // The old one changing is the problem
+                            offendingTemplateToUnreferencedDataStreams.computeIfAbsent(
+                                originalTemplate,
+                                (k) -> new HashSet<>()
+                            ).add(dataStream);
+                        } else if (oldTemplateWasRemoved) {
+                            // Old template was removed and the new template (unchanged) is now incorrectly applied
+                            // The old one disappearing is the problem
+                            removedTemplateToUnreferencedDataStreams.computeIfAbsent(
+                                originalTemplate,
+                                (k) -> new HashSet<>()
+                            ).add(dataStream);
+                        }
                     }
                 }
             }
@@ -1365,8 +1565,8 @@ public class MetadataIndexTemplateService
 
         // If we found any data streams that used to be covered, but will no longer be covered by
         // changing this template, then blow up with as much helpful information as we can muster
+        IllegalArgumentException validationFailure = null;
         if (offendingTemplateToUnreferencedDataStreams.isEmpty() == false) {
-            IllegalArgumentException validationFailure = null;
             for (Map.Entry<String, Set<String>> templateErrors : offendingTemplateToUnreferencedDataStreams.entrySet()) {
                 String templateName = templateErrors.getKey();
                 Set<String> newlyUnreferenced = templateErrors.getValue();
@@ -1390,16 +1590,45 @@ public class MetadataIndexTemplateService
                     validationFailure.addSuppressed(failure);
                 }
             }
-            throw validationFailure;
-        } else if (unreferencedDataStreamsWithoutTemplateChange.isEmpty() == false) {
+        }
+
+        if (removedTemplateToUnreferencedDataStreams.isEmpty() == false) {
+            TreeSet<String> dataStreamsUsingTemplates = removedTemplateToUnreferencedDataStreams.values()
+                .stream()
+                .flatMap(Set::stream)
+                .collect(Collectors.toCollection(TreeSet::new));
+            IllegalArgumentException failure = new IllegalArgumentException(
+                "unable to remove composable templates "
+                    + new TreeSet<>(removedTemplateToUnreferencedDataStreams.keySet())
+                    + " as they are in use by a data streams "
+                    + dataStreamsUsingTemplates
+            );
+            if (validationFailure == null) {
+                validationFailure = failure;
+            } else {
+                validationFailure.addSuppressed(failure);
+            }
+        }
+
+        if (unreferencedDataStreamsWithoutTemplateChange.isEmpty() == false) {
             // For sanity if assertions are disabled
-            throw new IllegalArgumentException(
+            IllegalArgumentException failure = new IllegalArgumentException(
                 "update for templates "
                     + updatedIndexTemplateNames
                     + "would cause data streams "
                     + unreferencedDataStreamsWithoutTemplateChange
                     + " to no longer match a data stream template"
             );
+            if (validationFailure == null) {
+                validationFailure = failure;
+            } else {
+                validationFailure.addSuppressed(failure);
+            }
+        }
+
+        // Finally, throw if necessary
+        if (validationFailure != null) {
+            throw validationFailure;
         }
     }
 
@@ -1575,7 +1804,7 @@ public class MetadataIndexTemplateService
             "remove-index-template-v2 [" + String.join(",", names) + "]",
             new TemplateClusterStateUpdateTask(listener, projectId) {
                 @Override
-                public ProjectMetadata execute(ProjectMetadata currentProject) {
+                public ProjectMetadata execute(ProjectMetadata currentProject) throws Exception {
                     return innerRemoveIndexTemplateV2(currentProject, names);
                 }
             },
@@ -1584,65 +1813,20 @@ public class MetadataIndexTemplateService
     }
 
     // Public because it's used by ReservedComposableIndexTemplateAction
-    public static ProjectMetadata innerRemoveIndexTemplateV2(ProjectMetadata project, String... names) {
-        Set<String> templateNames = new HashSet<>();
-
-        if (names.length > 1) {
-            Set<String> missingNames = null;
-            for (String name : names) {
-                if (project.templatesV2().containsKey(name)) {
-                    templateNames.add(name);
-                } else {
-                    // wildcards are not supported, so if a name with a wildcard is specified then
-                    // the else clause gets executed, because template names can't contain a wildcard.
-                    if (missingNames == null) {
-                        missingNames = new LinkedHashSet<>();
-                    }
-                    missingNames.add(name);
-                }
+    public ProjectMetadata innerRemoveIndexTemplateV2(ProjectMetadata project, String... names) throws Exception {
+        BulkApplyResult result = processBulkTemplateUpdate(
+            project,
+            Map.of(),
+            Map.of(),
+            Set.of(),
+            Set.of(names)
+        );
+        result.info.ifPresent(info -> {
+            for (String templateName : info.removedComposableTemplates) {
+                logger.info("removing index template [{}]", templateName);
             }
-
-            if (missingNames != null) {
-                throw new IndexTemplateMissingException(String.join(",", missingNames));
-            }
-        } else {
-            final String name = names[0];
-            for (String templateName : project.templatesV2().keySet()) {
-                if (Regex.simpleMatch(name, templateName)) {
-                    templateNames.add(templateName);
-                }
-            }
-            if (templateNames.isEmpty()) {
-                // if it's a match all pattern, and no templates are found (we have none), don't
-                // fail with index missing...
-                boolean isMatchAll = false;
-                if (Regex.isMatchAllPattern(name)) {
-                    isMatchAll = true;
-                }
-                if (isMatchAll) {
-                    return project;
-                } else {
-                    throw new IndexTemplateMissingException(name);
-                }
-            }
-        }
-
-        Set<String> dataStreamsUsingTemplates = dataStreamsExclusivelyUsingTemplates(project, templateNames);
-        if (dataStreamsUsingTemplates.size() > 0) {
-            throw new IllegalArgumentException(
-                "unable to remove composable templates "
-                    + new TreeSet<>(templateNames)
-                    + " as they are in use by a data streams "
-                    + new TreeSet<>(dataStreamsUsingTemplates)
-            );
-        }
-
-        ProjectMetadata.Builder builder = ProjectMetadata.builder(project);
-        for (String templateName : templateNames) {
-            logger.info("removing index template [{}]", templateName);
-            builder.removeIndexTemplate(templateName);
-        }
-        return builder.build();
+        });
+        return result.project;
     }
 
     /**
@@ -2478,7 +2662,7 @@ public class MetadataIndexTemplateService
             MetadataCreateIndexService.resolveAndValidateAliases(
                 temporaryIndexName,
                 Collections.emptySet(),
-                MetadataIndexTemplateService.resolveAliases(project, template),
+                resolveAliases(project, template),
                 project,
                 // the context is only used for validation so it's fine to pass fake values for the
                 // shard id and the current timestamp
