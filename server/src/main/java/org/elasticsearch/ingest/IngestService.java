@@ -113,7 +113,7 @@ import java.util.stream.Collectors;
 
 import static org.elasticsearch.core.Strings.format;
 import static org.elasticsearch.core.UpdateForV10.Owner.DATA_MANAGEMENT;
-import static org.elasticsearch.ingest.IngestService.BulkPipelineCreateOperation;
+import static org.elasticsearch.ingest.IngestService.BulkPipelineOperation;
 
 /**
  * Holder class for several ingest related services.
@@ -122,23 +122,26 @@ public class IngestService
     implements
         ClusterStateApplier,
         ReportingService<IngestInfo>,
-        BulkMetadataService<BulkPipelineCreateOperation, NodesInfoResponse, Void> {
+        BulkMetadataService<BulkPipelineOperation, NodesInfoResponse, Void> {
 
     public static final String NOOP_PIPELINE_NAME = "_none";
 
     public static final String INGEST_ORIGIN = "ingest";
 
     public static final String BULK_METADATA_SERVICE_NAME = "elasticsearch.ingest";
-    public static final class BulkPipelineCreateOperation extends BulkMetadataOperation {
+    public static final class BulkPipelineOperation extends BulkMetadataOperation {
         final List<PutPipelineRequest> requests;
-        public BulkPipelineCreateOperation(List<PutPipelineRequest> requests) {
+        final List<DeletePipelineRequest> deleteRequests;
+
+        public BulkPipelineOperation(List<PutPipelineRequest> requests, List<DeletePipelineRequest> deleteRequests) {
             super(BULK_METADATA_SERVICE_NAME);
             this.requests = requests;
+            this.deleteRequests = deleteRequests;
         }
 
         @Override
         public boolean isEmpty() {
-            return requests == null || requests.isEmpty();
+            return (requests == null || requests.isEmpty()) && (deleteRequests == null || deleteRequests.isEmpty());
         }
     }
 
@@ -363,10 +366,10 @@ public class IngestService
     }
 
     @Override
-    public BulkMetadataServiceTask<BulkPipelineCreateOperation, NodesInfoResponse, Void> createTask(
+    public BulkMetadataServiceTask<BulkPipelineOperation, NodesInfoResponse, Void> createTask(
         BulkMetadataOperation op
     ) {
-        return new BulkMetadataServiceTask<>(this, (BulkPipelineCreateOperation) op);
+        return new BulkMetadataServiceTask<>(this, (BulkPipelineOperation) op);
     }
 
     private static Map<String, Processor.Factory> processorFactories(List<IngestPlugin> ingestPlugins, Processor.Parameters parameters) {
@@ -511,27 +514,7 @@ public class IngestService
 
         @Override
         public IngestMetadata execute(IngestMetadata currentIngestMetadata, Collection<IndexMetadata> allIndexMetadata) {
-            if (currentIngestMetadata == null) {
-                return null;
-            }
-            Map<String, PipelineConfiguration> pipelines = currentIngestMetadata.getPipelines();
-            Set<String> toRemove = new HashSet<>();
-            for (String pipelineKey : pipelines.keySet()) {
-                if (Regex.simpleMatch(request.getId(), pipelineKey)) {
-                    toRemove.add(pipelineKey);
-                }
-            }
-            if (toRemove.isEmpty() && Regex.isMatchAllPattern(request.getId()) == false) {
-                throw new ResourceNotFoundException("pipeline [{}] is missing", request.getId());
-            } else if (toRemove.isEmpty()) {
-                return currentIngestMetadata;
-            }
-            final Map<String, PipelineConfiguration> pipelinesCopy = new HashMap<>(pipelines);
-            for (String key : toRemove) {
-                validateNotInUse(key, allIndexMetadata);
-                pipelinesCopy.remove(key);
-            }
-            return new IngestMetadata(pipelinesCopy);
+            return clusterStateBulkUpdatePipelines(currentIngestMetadata, List.of(), List.of(request), allIndexMetadata, Instant::now);
         }
     }
 
@@ -643,35 +626,50 @@ public class IngestService
     }
 
     @Override
-    public BulkPipelineCreateOperation filterBatch(BulkPipelineCreateOperation batch, ProjectMetadata currentProject) {
+    public BulkPipelineOperation filterBatch(BulkPipelineOperation batch, ProjectMetadata currentProject) {
         // Use the view of the project metadata that is already present in the copy of the cluster state stored locally in this service.
         // This is the most up-to-date version of the cluster state since the IngestService is an ClusterStateApplier and points to the
         // latest cluster state, which may not be fully published yet. This maintains parity with the original way we checked for no op
         // pipeline updates before BulkMetadataService was introduced.
         final ProjectMetadata locallyAvailableProject = state.metadata().getProject(currentProject.id());
         // if any of the existing pipelines match the request pipelines -- no need to update that pipeline
-        return new BulkPipelineCreateOperation(
-            batch.requests.stream().filter(request -> isNoOpPipelineUpdate(locallyAvailableProject, request) == false).toList()
+        return new BulkPipelineOperation(
+            batch.requests.stream().filter(request -> isNoOpPipelineUpdate(locallyAvailableProject, request) == false).toList(),
+            batch.deleteRequests
         );
     }
 
     @Override
-    public void collectDependencies(BulkPipelineCreateOperation batch, ActionListener<NodesInfoResponse> listener) {
-        nodeInfoListener.accept(listener);
+    public void collectDependencies(BulkPipelineOperation batch, ActionListener<NodesInfoResponse> listener) {
+        if (batch.requests.isEmpty()) {
+            // We only need to launch the node info collection if there are new pipelines to add
+            listener.onResponse(null);
+        } else {
+            nodeInfoListener.accept(listener);
+        }
     }
 
     @Override
-    public void dependencyValidation(BulkPipelineCreateOperation batch, ProjectMetadata currentProject, NodesInfoResponse nodeInfos)
+    public void dependencyValidation(BulkPipelineOperation batch, ProjectMetadata currentProject, NodesInfoResponse nodeInfos)
         throws Exception {
+        if (nodeInfos == null && batch.requests.isEmpty() == false) {
+            throw new IllegalStateException("Node info could not be found to apply ingest pipeline updates");
+        }
         for (PutPipelineRequest request : batch.requests) {
             validatePipelineRequest(currentProject.id(), request, nodeInfos);
         }
     }
 
     @Override
-    public BulkMetadataOperationContext<Void> applyBatch(BulkPipelineCreateOperation batch, ProjectMetadata currentProject) {
+    public BulkMetadataOperationContext<Void> applyBatch(BulkPipelineOperation batch, ProjectMetadata currentProject) {
         IngestMetadata initialIngestMetadata = currentProject.custom(IngestMetadata.TYPE);
-        IngestMetadata finalIngestMetadata = clusterStateBulkUpdatePipelines(initialIngestMetadata, batch.requests, Instant::now);
+        IngestMetadata finalIngestMetadata = clusterStateBulkUpdatePipelines(
+            initialIngestMetadata,
+            batch.requests,
+            batch.deleteRequests,
+            currentProject.indices().values(),
+            Instant::now
+        );
         if (finalIngestMetadata == initialIngestMetadata) {
             return BulkMetadataOperationContext.noContext(currentProject);
         } else {
@@ -850,7 +848,7 @@ public class IngestService
 
         @Override
         public IngestMetadata execute(IngestMetadata currentIngestMetadata, Collection<IndexMetadata> allIndexMetadata) {
-            return clusterStateBulkUpdatePipelines(currentIngestMetadata, List.of(request), instantSource);
+            return clusterStateBulkUpdatePipelines(currentIngestMetadata, List.of(request), List.of(), allIndexMetadata, instantSource);
         }
     }
 
@@ -949,21 +947,63 @@ public class IngestService
     public static IngestMetadata clusterStateBulkUpdatePipelines(
         IngestMetadata currentIngestMetadata,
         List<PutPipelineRequest> requests,
+        List<DeletePipelineRequest> deleteRequests,
+        Collection<IndexMetadata> allIndexMetadata,
         InstantSource instantSource
     ) {
-        if (requests.isEmpty()) {
+        if (requests.isEmpty() && deleteRequests.isEmpty()) {
             return currentIngestMetadata;
         }
+        boolean pipelineMapCopied = false;
         Map<String, PipelineConfiguration> pipelines = null;
         for (PutPipelineRequest request : requests) {
             PipelineConfiguration pipelineSource = validatePipelineVersionAndGetSource(currentIngestMetadata, request, instantSource);
             if (pipelines == null) {
                 // Lazily construct the pipelines map until after the first operation is validated
                 pipelines = getPipelines(currentIngestMetadata);
+                pipelineMapCopied = true;
             }
             pipelines.put(request.getId(), pipelineSource);
         }
-        return new IngestMetadata(pipelines);
+        if (pipelines == null && currentIngestMetadata == null) {
+            // We have no pipelines, we didn't add any, and we don't have ingest metadata
+            // The old logic simply skips any deletions in this case.
+            return null;
+        } else if (pipelines == null) {
+            // Keep holding off on copying it
+            pipelines = currentIngestMetadata.getPipelines();
+        }
+        for (DeletePipelineRequest deleteRequest : deleteRequests) {
+            Set<String> toRemove = new HashSet<>();
+            for (String pipelineKey : pipelines.keySet()) {
+                if (Regex.simpleMatch(deleteRequest.getId(), pipelineKey)) {
+                    toRemove.add(pipelineKey);
+                }
+            }
+            if (toRemove.isEmpty() && Regex.isMatchAllPattern(deleteRequest.getId()) == false) {
+                throw new ResourceNotFoundException("pipeline [{}] is missing", deleteRequest.getId());
+            } else if (toRemove.isEmpty()) {
+                continue;
+            }
+
+            // Be as lazy as possible. We only want to copy the list of pipelines once this
+            // whole operation, and if we can get away with not copying it at all, then great.
+            if (pipelineMapCopied == false) {
+                pipelines = new HashMap<>(pipelines);
+                pipelineMapCopied = true;
+            }
+
+            for (String key : toRemove) {
+                validateNotInUse(key, allIndexMetadata);
+                pipelines.remove(key);
+            }
+        }
+        if (pipelineMapCopied == false) {
+            // We somehow never made any changes
+            return currentIngestMetadata;
+        } else {
+            return new IngestMetadata(pipelines);
+        }
     }
 
     @UpdateForV10(owner = DATA_MANAGEMENT) // Change deprecation log for special characters in name to a failure
