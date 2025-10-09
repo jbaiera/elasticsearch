@@ -54,9 +54,9 @@ import java.util.TreeMap;
 import static org.elasticsearch.xpack.core.ilm.LifecycleOperationMetadata.currentILMMode;
 import static org.elasticsearch.xpack.core.searchablesnapshots.SearchableSnapshotsConstants.SEARCHABLE_SNAPSHOT_FEATURE;
 
-public class PutLifecycleMetadataService implements BulkMetadataService<PutLifecycleMetadataService.BulkPutLifecycleOperation, Void, Void> {
+public class LifecycleMetadataService implements BulkMetadataService<LifecycleMetadataService.BulkPutLifecycleOperation, Void, Void> {
 
-    private static final Logger logger = LogManager.getLogger(PutLifecycleMetadataService.class);
+    private static final Logger logger = LogManager.getLogger(LifecycleMetadataService.class);
 
     private static final String BULK_METADATA_SERVICE_NAME = "elasticsearch.xpack.ilm";
 
@@ -68,7 +68,7 @@ public class PutLifecycleMetadataService implements BulkMetadataService<PutLifec
     private final ProjectResolver projectResolver;
     private final MasterServiceTaskQueue<BulkUpdateLifecyclePolicyTask> taskQueue;
 
-    public PutLifecycleMetadataService(
+    public LifecycleMetadataService(
         ClusterService clusterService,
         NamedXContentRegistry xContentRegistry,
         Client client,
@@ -85,7 +85,7 @@ public class PutLifecycleMetadataService implements BulkMetadataService<PutLifec
         this.taskQueue = clusterService.createTaskQueue(
             "ilm-put-lifecycle-queue",
             Priority.NORMAL,
-            new PutLifecycleMetadataService.IlmLifecycleExecutor()
+            new LifecycleMetadataService.IlmLifecycleExecutor()
         );
     }
 
@@ -137,7 +137,7 @@ public class PutLifecycleMetadataService implements BulkMetadataService<PutLifec
 
     @Override
     public BulkPutLifecycleOperation filterBatch(
-        PutLifecycleMetadataService.BulkPutLifecycleOperation batch,
+        LifecycleMetadataService.BulkPutLifecycleOperation batch,
         ProjectMetadata currentProject
     ) {
         // headers from the thread context stored by the AuthenticationService to be shared between the
@@ -164,14 +164,14 @@ public class PutLifecycleMetadataService implements BulkMetadataService<PutLifec
 
     @Override
     public BulkMetadataOperationContext<Void> applyBatch(
-        PutLifecycleMetadataService.BulkPutLifecycleOperation batch,
+        LifecycleMetadataService.BulkPutLifecycleOperation batch,
         ProjectMetadata previousProject
     ) {
         return doApplyBatch(batch, previousProject, licenseState, xContentRegistry, client);
     }
 
     private static BulkMetadataOperationContext<Void> doApplyBatch(
-        PutLifecycleMetadataService.BulkPutLifecycleOperation batch,
+        LifecycleMetadataService.BulkPutLifecycleOperation batch,
         ProjectMetadata previousProject,
         XPackLicenseState licenseState,
         NamedXContentRegistry xContentRegistry,
@@ -236,7 +236,7 @@ public class PutLifecycleMetadataService implements BulkMetadataService<PutLifec
     }
 
     public void addLifecycle(PutLifecycleRequest request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
-        var bulkOp = new PutLifecycleMetadataService.BulkPutLifecycleOperation(List.of(request), true);
+        var bulkOp = new LifecycleMetadataService.BulkPutLifecycleOperation(List.of(request), true);
         final ProjectId projectId = projectResolver.getProjectId();
         ProjectMetadata projectMetadata = state.getMetadata().getProject(projectId);
         validateBatch(bulkOp, projectMetadata);
@@ -244,7 +244,7 @@ public class PutLifecycleMetadataService implements BulkMetadataService<PutLifec
         if (finalBulkOp.isEmpty()) {
             return;
         }
-        var putTask = new PutLifecycleMetadataService.BulkUpdateLifecyclePolicyTask(request, listener) {
+        var putTask = new LifecycleMetadataService.BulkUpdateLifecyclePolicyTask(request, listener) {
             @Override
             public ClusterState execute(ClusterState currentState) throws Exception {
                 var currentMetadata = currentState.getMetadata().getProject(projectId);
@@ -266,7 +266,7 @@ public class PutLifecycleMetadataService implements BulkMetadataService<PutLifec
     /**
      * Returns 'true' if the ILM policy is effectually the same (same policy and headers), and thus can be a no-op update.
      */
-    static boolean isNoopUpdate(
+    public static boolean isNoopUpdate(
         @Nullable LifecyclePolicyMetadata existingPolicy,
         LifecyclePolicy newPolicy,
         Map<String, String> filteredHeaders
@@ -392,7 +392,7 @@ public class PutLifecycleMetadataService implements BulkMetadataService<PutLifec
         public ClusterState execute(ClusterState currentState) throws Exception {
             var projectMetadata = currentState.getMetadata().getProject(projectId);
             BulkMetadataOperationContext<Void> result = doApplyBatch(
-                new PutLifecycleMetadataService.BulkPutLifecycleOperation(List.of(request), filteredHeaders, verboseLogging),
+                new LifecycleMetadataService.BulkPutLifecycleOperation(List.of(request), filteredHeaders, verboseLogging),
                 projectMetadata,
                 licenseState,
                 xContentRegistry,
@@ -407,10 +407,10 @@ public class PutLifecycleMetadataService implements BulkMetadataService<PutLifec
     }
 
     private static class IlmLifecycleExecutor extends SimpleBatchedAckListenerTaskExecutor<
-        PutLifecycleMetadataService.BulkUpdateLifecyclePolicyTask> {
+        LifecycleMetadataService.BulkUpdateLifecyclePolicyTask> {
         @Override
         public Tuple<ClusterState, ClusterStateAckListener> executeTask(
-            PutLifecycleMetadataService.BulkUpdateLifecyclePolicyTask task,
+            LifecycleMetadataService.BulkUpdateLifecyclePolicyTask task,
             ClusterState clusterState
         )
             throws Exception {
