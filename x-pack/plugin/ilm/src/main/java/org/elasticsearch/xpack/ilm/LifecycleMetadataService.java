@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.ilm;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.elasticsearch.ResourceNotFoundException;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
 import org.elasticsearch.client.internal.Client;
@@ -18,6 +19,7 @@ import org.elasticsearch.cluster.ClusterStateAckListener;
 import org.elasticsearch.cluster.SimpleBatchedAckListenerTaskExecutor;
 import org.elasticsearch.cluster.metadata.BulkMetadataService;
 import org.elasticsearch.cluster.metadata.BulkMetadataServiceTask;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.cluster.metadata.RepositoriesMetadata;
@@ -39,6 +41,7 @@ import org.elasticsearch.xpack.core.ilm.Phase;
 import org.elasticsearch.xpack.core.ilm.PhaseCacheManagement;
 import org.elasticsearch.xpack.core.ilm.SearchableSnapshotAction;
 import org.elasticsearch.xpack.core.ilm.WaitForSnapshotAction;
+import org.elasticsearch.xpack.core.ilm.action.DeleteLifecycleAction;
 import org.elasticsearch.xpack.core.ilm.action.PutLifecycleRequest;
 import org.elasticsearch.xpack.core.slm.SnapshotLifecycleMetadata;
 import org.elasticsearch.xpack.ilm.action.ReservedLifecycleAction;
@@ -46,15 +49,18 @@ import org.elasticsearch.xpack.ilm.action.ReservedLifecycleAction;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.stream.Collectors;
 
 import static org.elasticsearch.xpack.core.ilm.LifecycleOperationMetadata.currentILMMode;
 import static org.elasticsearch.xpack.core.searchablesnapshots.SearchableSnapshotsConstants.SEARCHABLE_SNAPSHOT_FEATURE;
 
-public class LifecycleMetadataService implements BulkMetadataService<LifecycleMetadataService.BulkPutLifecycleOperation, Void, Void> {
+public class LifecycleMetadataService implements BulkMetadataService<LifecycleMetadataService.BulkLifecycleOperation, Void, Void> {
 
     private static final Logger logger = LogManager.getLogger(LifecycleMetadataService.class);
 
@@ -95,40 +101,51 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
     }
 
     @Override
-    public BulkMetadataServiceTask<BulkPutLifecycleOperation, Void, Void> createTask(
+    public BulkMetadataServiceTask<BulkLifecycleOperation, Void, Void> createTask(
         BulkMetadataOperation op
     ) {
-        return new BulkMetadataServiceTask<>(this, (BulkPutLifecycleOperation) op);
+        return new BulkMetadataServiceTask<>(this, (BulkLifecycleOperation) op);
     }
 
-    public static class BulkPutLifecycleOperation extends BulkMetadataOperation {
+    public static class BulkLifecycleOperation extends BulkMetadataOperation {
         final List<PutLifecycleRequest> requests;
         final Map<String, String> filteredHeaders;
+        final List<DeleteLifecycleAction.Request> deleteRequests;
         final boolean verboseLogging;
 
-        public BulkPutLifecycleOperation(List<PutLifecycleRequest> requests, boolean verboseLogging) {
+        public BulkLifecycleOperation(List<PutLifecycleRequest> requests, boolean verboseLogging) {
             this(requests, null, verboseLogging);
         }
 
-        public BulkPutLifecycleOperation(
+        public BulkLifecycleOperation(
             List<PutLifecycleRequest> requests,
             Map<String, String> filteredHeaders,
+            boolean verboseLogging
+        ) {
+            this(requests, filteredHeaders, List.of(), verboseLogging);
+        }
+
+        public BulkLifecycleOperation(
+            List<PutLifecycleRequest> requests,
+            Map<String, String> filteredHeaders,
+            List<DeleteLifecycleAction.Request> deleteRequestsRequests,
             boolean verboseLogging
         ) {
             super(BULK_METADATA_SERVICE_NAME);
             this.requests = requests;
             this.filteredHeaders = filteredHeaders;
+            this.deleteRequests = deleteRequestsRequests;
             this.verboseLogging = verboseLogging;
         }
 
         @Override
         public boolean isEmpty() {
-            return requests == null || requests.isEmpty();
+            return (requests == null || requests.isEmpty()) && (deleteRequests == null || deleteRequests.isEmpty());
         }
     }
 
     @Override
-    public void validateBatch(BulkPutLifecycleOperation batch, ProjectMetadata currentProject) {
+    public void validateBatch(BulkLifecycleOperation batch, ProjectMetadata currentProject) {
         for (PutLifecycleRequest request : batch.requests) {
             LifecyclePolicy.validatePolicyName(request.getPolicy().getName());
             request.getPolicy().maybeAddDeprecationWarningForFreezeAction(request.getPolicy().getName());
@@ -136,8 +153,8 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
     }
 
     @Override
-    public BulkPutLifecycleOperation filterBatch(
-        LifecycleMetadataService.BulkPutLifecycleOperation batch,
+    public BulkLifecycleOperation filterBatch(
+        BulkLifecycleOperation batch,
         ProjectMetadata currentProject
     ) {
         // headers from the thread context stored by the AuthenticationService to be shared between the
@@ -159,19 +176,19 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
             }
         }
         // Capture the filtered headers on the operation
-        return new BulkPutLifecycleOperation(filteredRequests, filteredHeaders, batch.verboseLogging);
+        return new BulkLifecycleOperation(filteredRequests, filteredHeaders, batch.verboseLogging);
     }
 
     @Override
     public BulkMetadataOperationContext<Void> applyBatch(
-        LifecycleMetadataService.BulkPutLifecycleOperation batch,
+        BulkLifecycleOperation batch,
         ProjectMetadata previousProject
     ) {
         return doApplyBatch(batch, previousProject, licenseState, xContentRegistry, client);
     }
 
     private static BulkMetadataOperationContext<Void> doApplyBatch(
-        LifecycleMetadataService.BulkPutLifecycleOperation batch,
+        BulkLifecycleOperation batch,
         ProjectMetadata previousProject,
         XPackLicenseState licenseState,
         NamedXContentRegistry xContentRegistry,
@@ -179,12 +196,13 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
     ) {
         final IndexLifecycleMetadata currentMetadata = previousProject.custom(IndexLifecycleMetadata.TYPE, IndexLifecycleMetadata.EMPTY);
 
-        SortedMap<String, LifecyclePolicyMetadata> newPolicies = new TreeMap<>(currentMetadata.getPolicyMetadatas());
-
         ProjectMetadata.Builder projectBuilder = null;
-        boolean updatesToPolicies = false;
+        SortedMap<String, LifecyclePolicyMetadata> newPolicies = null;
+        boolean policyChanges = false;
+
         for (PutLifecycleRequest request : batch.requests) {
-            final LifecyclePolicyMetadata existingPolicyMetadata = currentMetadata.getPolicyMetadatas().get(request.getPolicy().getName());
+            Map<String, LifecyclePolicyMetadata> checkPolicies = newPolicies == null ? currentMetadata.getPolicyMetadatas() : newPolicies;
+            final LifecyclePolicyMetadata existingPolicyMetadata = checkPolicies.get(request.getPolicy().getName());
 
             // Double-check for no-op in the state update task, in case it was changed/reset in the meantime
             if (isNoopUpdate(existingPolicyMetadata, request.getPolicy(), batch.filteredHeaders)) {
@@ -199,9 +217,9 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
                 nextVersion,
                 Instant.now().toEpochMilli()
             );
-            updatesToPolicies = true;
-            if (projectBuilder == null) {
-                projectBuilder = ProjectMetadata.builder(previousProject);
+            policyChanges = true;
+            if (newPolicies == null) {
+                newPolicies = new TreeMap<>(currentMetadata.getPolicyMetadatas());
             }
             LifecyclePolicyMetadata oldPolicy = newPolicies.put(lifecyclePolicyMetadata.getName(), lifecyclePolicyMetadata);
             if (batch.verboseLogging) {
@@ -213,6 +231,11 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
             }
 
             if (oldPolicy != null) {
+                if (projectBuilder == null) {
+                    // Put off on making the project builder for as long as possible
+                    projectBuilder = ProjectMetadata.builder(previousProject);
+                }
+
                 // This used to have logic for if the refresh failed, but it doesn't look like it gets caught and logged earlier on,
                 // thus keeping this from ever having an issue.
                 PhaseCacheManagement.updateIndicesForPolicy(
@@ -226,8 +249,43 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
                 );
             }
         }
-        if (updatesToPolicies) {
+
+        if (batch.deleteRequests.isEmpty() == false) {
+            final Set<String> policiesToDelete = batch.deleteRequests.stream()
+                .map(DeleteLifecycleAction.Request::getPolicyName)
+                .collect(Collectors.toSet());
+            // Most common case will likely be a single delete operation
+            Map<String, List<String>> policiesRequiredByIndices = HashMap.newHashMap(policiesToDelete.size());
+            for (IndexMetadata idxMeta : previousProject.indices().values()) {
+                if (idxMeta.getLifecyclePolicyName() != null && policiesToDelete.contains(idxMeta.getLifecyclePolicyName())) {
+                    String name = idxMeta.getIndex().getName();
+                    policiesRequiredByIndices.computeIfAbsent(idxMeta.getLifecyclePolicyName(), k -> new ArrayList<>()).add(name);
+                }
+            }
+            if (policiesRequiredByIndices.isEmpty() == false) {
+                throw collectExceptionsForRequiredPolicies(policiesRequiredByIndices);
+            }
+
+            for (String policyToDelete : policiesToDelete) {
+                Map<String, LifecyclePolicyMetadata> checkPolicies = newPolicies == null
+                    ? currentMetadata.getPolicyMetadatas()
+                    : newPolicies;
+                if (checkPolicies.containsKey(policyToDelete) == false) {
+                    throw new ResourceNotFoundException("Lifecycle policy not found: {}", policyToDelete);
+                }
+                policyChanges = true;
+                if (newPolicies == null) {
+                    newPolicies = new TreeMap<>(currentMetadata.getPolicyMetadatas());
+                }
+                newPolicies.remove(policyToDelete);
+            }
+        }
+
+        if (policyChanges) {
             IndexLifecycleMetadata newMetadata = new IndexLifecycleMetadata(newPolicies, currentILMMode(previousProject));
+            if (projectBuilder == null) {
+                projectBuilder = ProjectMetadata.builder(previousProject);
+            }
             projectBuilder.putCustom(IndexLifecycleMetadata.TYPE, newMetadata);
             return BulkMetadataOperationContext.noContext(projectBuilder.build());
         } else {
@@ -235,8 +293,35 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
         }
     }
 
+    /**
+     * Compiles together all policies that could not be deleted because they are still in use by indices into an
+     * {@link IllegalArgumentException}, returning the first exception with all following exceptions suppressed.
+     *
+     * @param policiesRequiredByIndices A map of policy name to the list of indices that require it.
+     * @return An {@link IllegalArgumentException} for the first policy in the map, with any further exceptions suppressed under it.
+     */
+    private static IllegalArgumentException collectExceptionsForRequiredPolicies(Map<String, List<String>> policiesRequiredByIndices) {
+        IllegalArgumentException exception = null;
+        for (Map.Entry<String, List<String>> entry : policiesRequiredByIndices.entrySet()) {
+            String policyName = entry.getKey();
+            List<String> indicesUsingPolicy = entry.getValue();
+            IllegalArgumentException iae = new IllegalArgumentException(
+                "Cannot delete policy ["
+                    + policyName
+                    + "]. It is in use by one or more indices: "
+                    + indicesUsingPolicy
+            );
+            if (exception == null) {
+                exception = iae;
+            } else {
+                exception.addSuppressed(iae);
+            }
+        }
+        return exception;
+    }
+
     public void addLifecycle(PutLifecycleRequest request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
-        var bulkOp = new LifecycleMetadataService.BulkPutLifecycleOperation(List.of(request), true);
+        var bulkOp = new BulkLifecycleOperation(List.of(request), true);
         final ProjectId projectId = projectResolver.getProjectId();
         ProjectMetadata projectMetadata = state.getMetadata().getProject(projectId);
         validateBatch(bulkOp, projectMetadata);
@@ -392,7 +477,7 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
         public ClusterState execute(ClusterState currentState) throws Exception {
             var projectMetadata = currentState.getMetadata().getProject(projectId);
             BulkMetadataOperationContext<Void> result = doApplyBatch(
-                new LifecycleMetadataService.BulkPutLifecycleOperation(List.of(request), filteredHeaders, verboseLogging),
+                new BulkLifecycleOperation(List.of(request), filteredHeaders, verboseLogging),
                 projectMetadata,
                 licenseState,
                 xContentRegistry,
