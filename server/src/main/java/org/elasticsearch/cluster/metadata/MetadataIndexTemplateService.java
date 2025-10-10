@@ -354,7 +354,23 @@ public class MetadataIndexTemplateService
 
     private record BulkApplyResult(ProjectMetadata project, Optional<InterimTemplateValidationInfo> info) {}
 
-    private BulkApplyResult processBulkTemplateUpdate(
+    public ProjectMetadata processBulkTemplateUpdate(
+        final ProjectMetadata currentProject,
+        final Map<String, ComponentTemplateOperation> componentTemplateOperations,
+        final Map<String, ComposableTemplateOperation> composableTemplateOperations,
+        final Set<String> componentTemplateRemovals,
+        final Set<String> composableTemplateRemovals
+    ) throws Exception {
+        return doProcessBulkTemplateUpdate(
+            currentProject,
+            componentTemplateOperations,
+            composableTemplateOperations,
+            componentTemplateRemovals,
+            composableTemplateRemovals
+        ).project;
+    }
+
+    private BulkApplyResult doProcessBulkTemplateUpdate(
         final ProjectMetadata currentProject,
         final Map<String, ComponentTemplateOperation> componentTemplateOperations,
         final Map<String, ComposableTemplateOperation> composableTemplateOperations,
@@ -957,7 +973,7 @@ public class MetadataIndexTemplateService
         final String name,
         final ComponentTemplate template
     ) throws Exception {
-        ProjectMetadata newProject = processBulkTemplateUpdate(
+        ProjectMetadata newProject = doProcessBulkTemplateUpdate(
             currentProject,
             Map.of(name, new ComponentTemplateOperation(name, template, create)),
             Map.of(),
@@ -1031,7 +1047,7 @@ public class MetadataIndexTemplateService
 
     // Exposed for ReservedComponentTemplateAction
     public ProjectMetadata innerRemoveComponentTemplate(ProjectMetadata project, String... names) throws Exception {
-        BulkApplyResult result = processBulkTemplateUpdate(
+        BulkApplyResult result = doProcessBulkTemplateUpdate(
             project,
             Map.of(),
             Map.of(),
@@ -1189,7 +1205,7 @@ public class MetadataIndexTemplateService
         final ComposableIndexTemplate template,
         final boolean validateV2Overlaps
     ) throws Exception {
-        ProjectMetadata newProject = processBulkTemplateUpdate(
+        ProjectMetadata newProject = doProcessBulkTemplateUpdate(
             project,
             Map.of(),
             Map.of(name, new ComposableTemplateOperation(name, template, create, validateV2Overlaps)),
@@ -1814,7 +1830,7 @@ public class MetadataIndexTemplateService
 
     // Public because it's used by ReservedComposableIndexTemplateAction
     public ProjectMetadata innerRemoveIndexTemplateV2(ProjectMetadata project, String... names) throws Exception {
-        BulkApplyResult result = processBulkTemplateUpdate(
+        BulkApplyResult result = doProcessBulkTemplateUpdate(
             project,
             Map.of(),
             Map.of(),
