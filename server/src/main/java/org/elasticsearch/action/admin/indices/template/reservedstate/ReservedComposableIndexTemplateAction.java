@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static org.elasticsearch.common.xcontent.XContentHelper.mapToXContentParser;
@@ -152,49 +153,55 @@ public class ReservedComposableIndexTemplateAction
         var components = requests.componentTemplates;
         var composables = requests.composableTemplates;
 
-        // PRTODO: Update this to use the bulk create logic - we may want to add bulk delete logic to the services as well
-        // 1. create or update component templates (composable templates depend on them)
-        for (var request : components) {
-            ComponentTemplate template = TransportPutComponentTemplateAction.normalizeComponentTemplate(
-                request.componentTemplate(),
-                indexScopedSettings
-            );
-
-            project = indexTemplateService.addComponentTemplate(project, false, request.name(), template);
-        }
-
-        // 2. create or update composable index templates, no overlap validation
-        for (var request : composables) {
-            MetadataIndexTemplateService.validateV2TemplateRequest(project, request.name(), request.indexTemplate());
-            project = indexTemplateService.addIndexTemplateV2(project, false, request.name(), request.indexTemplate(), false);
-        }
-
         Set<String> composableEntities = composables.stream().map(r -> reservedComposableIndexName(r.name())).collect(Collectors.toSet());
         Set<String> composablesToDelete = prevState.keys()
             .stream()
             .filter(k -> k.startsWith(COMPOSABLE_PREFIX) && composableEntities.contains(k) == false)
             .collect(Collectors.toSet());
 
-        // 3. delete composable index templates (this will fail on attached data streams, unless we added a higher priority one)
-        if (composablesToDelete.isEmpty() == false) {
-            var composableNames = composablesToDelete.stream().map(c -> composableIndexNameFromReservedName(c)).toArray(String[]::new);
-            project = indexTemplateService.innerRemoveIndexTemplateV2(project, composableNames);
-        }
-
-        // 4. validate for v2 composable template overlaps
-        for (var request : composables) {
-            MetadataIndexTemplateService.v2TemplateOverlaps(project.templatesV2(), request.name(), request.indexTemplate(), true);
-        }
-
         Set<String> componentEntities = components.stream().map(r -> reservedComponentName(r.name())).collect(Collectors.toSet());
         Set<String> componentsToDelete = prevState.keys().stream().filter(k -> k.startsWith(COMPONENT_PREFIX)).collect(Collectors.toSet());
         componentsToDelete.removeAll(componentEntities);
 
-        // 5. delete component templates (this will check if there are any related composable index templates and fail)
-        if (componentsToDelete.isEmpty() == false) {
-            var componentNames = componentsToDelete.stream().map(c -> componentNameFromReservedName(c)).toArray(String[]::new);
-            project = indexTemplateService.innerRemoveComponentTemplate(project, componentNames);
+        var addComponents = components.stream()
+            .map(
+                request -> new MetadataIndexTemplateService.ComponentTemplateOperation(
+                    request.name(),
+                    TransportPutComponentTemplateAction.normalizeComponentTemplate(request.componentTemplate(), indexScopedSettings),
+                    false
+                )
+            )
+            .collect(Collectors.toMap(MetadataIndexTemplateService.ComponentTemplateOperation::name, Function.identity()));
+        var addTemplates = composables.stream()
+            .map(
+                request -> new MetadataIndexTemplateService.ComposableTemplateOperation(
+                    request.name(),
+                    request.indexTemplate(),
+                    false,
+                    true
+                )
+            )
+            .collect(Collectors.toMap(MetadataIndexTemplateService.ComposableTemplateOperation::name, Function.identity()));
+
+        if (composablesToDelete.isEmpty() == false) {
+            composablesToDelete = composablesToDelete.stream()
+                .map(ReservedComposableIndexTemplateAction::composableIndexNameFromReservedName)
+                .collect(Collectors.toSet());
         }
+
+        if (componentsToDelete.isEmpty() == false) {
+            componentsToDelete = componentsToDelete.stream()
+                .map(ReservedComposableIndexTemplateAction::componentNameFromReservedName)
+                .collect(Collectors.toSet());
+        }
+
+        project = indexTemplateService.processBulkTemplateUpdate(
+            project,
+            addComponents,
+            addTemplates,
+            componentsToDelete,
+            composablesToDelete
+        );
 
         return new TransformState(
             ClusterState.builder(clusterState).putProjectMetadata(project).build(),
