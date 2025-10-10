@@ -24,6 +24,7 @@ import org.elasticsearch.xcontent.XContentParser;
 import org.elasticsearch.xcontent.XContentType;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
@@ -71,51 +72,31 @@ public class ReservedPipelineAction implements ReservedProjectStateHandler<List<
         return requests;
     }
 
-    private static ProjectMetadata wrapIngestTaskExecute(IngestService.PipelineClusterStateUpdateTask task, ProjectMetadata metadata) {
-        final var allIndexMetadata = metadata.indices().values();
-        final IngestMetadata currentIndexMetadata = metadata.custom(IngestMetadata.TYPE);
-
-        var updatedIngestMetadata = task.execute(currentIndexMetadata, allIndexMetadata);
-        return ProjectMetadata.builder(metadata).putCustom(IngestMetadata.TYPE, updatedIngestMetadata).build();
-    }
-
     @Override
     public TransformState transform(ProjectId projectId, List<PutPipelineRequest> source, TransformState prevState) throws Exception {
         var requests = prepare(source);
 
         ClusterState clusterState = prevState.state();
         ProjectMetadata projectMetadata = clusterState.metadata().getProject(projectId);
-
-        // PRTODO: Make this use the bulk operation
-        for (var request : requests) {
-            var nopUpdate = IngestService.isNoOpPipelineUpdate(projectMetadata, request);
-
-            if (nopUpdate) {
-                continue;
-            }
-
-            var task = new IngestService.PutPipelineClusterStateUpdateTask(projectMetadata.id(), request);
-            projectMetadata = wrapIngestTaskExecute(task, projectMetadata);
-        }
-
         Set<String> entities = requests.stream().map(PutPipelineRequest::getId).collect(Collectors.toSet());
-
         Set<String> toDelete = new HashSet<>(prevState.keys());
         toDelete.removeAll(entities);
 
-        for (var pipelineToDelete : toDelete) {
-            var task = new IngestService.DeletePipelineClusterStateUpdateTask(
-                projectMetadata.id(),
-                null,
-                new DeletePipelineRequest(
-                    RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
-                    RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
-                    pipelineToDelete
-                )
-            );
-            projectMetadata = wrapIngestTaskExecute(task, projectMetadata);
+        IngestService.BulkPipelineOperation bulkPipelineOperation = new IngestService.BulkPipelineOperation(requests, toDelete);
+        bulkPipelineOperation = IngestService.doFilterBatch(bulkPipelineOperation, projectMetadata);
+        if (bulkPipelineOperation.isEmpty()) {
+            return new TransformState(ClusterState.builder(clusterState).putProjectMetadata(projectMetadata).build(), entities);
         }
-
+        final var allIndexMetadata = projectMetadata.indices().values();
+        final IngestMetadata currentIndexMetadata = projectMetadata.custom(IngestMetadata.TYPE);
+        var updatedIngestMetadata = IngestService.clusterStateBulkUpdatePipelines(
+            currentIndexMetadata,
+            requests,
+            toDelete,
+            allIndexMetadata,
+            Instant::now
+        );
+        projectMetadata = ProjectMetadata.builder(projectMetadata).putCustom(IngestMetadata.TYPE, updatedIngestMetadata).build();
         return new TransformState(ClusterState.builder(clusterState).putProjectMetadata(projectMetadata).build(), entities);
     }
 
