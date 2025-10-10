@@ -20,7 +20,6 @@ import org.elasticsearch.xcontent.NamedXContentRegistry;
 import org.elasticsearch.xcontent.XContentParser;
 import org.elasticsearch.xcontent.XContentParserConfiguration;
 import org.elasticsearch.xpack.core.ilm.LifecyclePolicy;
-import org.elasticsearch.xpack.core.ilm.action.DeleteLifecycleAction;
 import org.elasticsearch.xpack.core.ilm.action.PutLifecycleRequest;
 import org.elasticsearch.xpack.ilm.LifecycleMetadataService;
 
@@ -83,39 +82,21 @@ public class ReservedLifecycleAction implements ReservedProjectStateHandler<List
     @Override
     public TransformState transform(ProjectId projectId, List<LifecyclePolicy> source, TransformState prevState) throws Exception {
         var requests = prepare(source);
-
-        ClusterState state = prevState.state();
-
-        // PRTODO: Make this a bulk operation
-        for (var request : requests) {
-            LifecycleMetadataService.UpdateLifecyclePolicyTask task = new LifecycleMetadataService.UpdateLifecyclePolicyTask(
-                state.metadata().getProject(projectId).id(),
-                request,
-                licenseState,
-                xContentRegistry,
-                client
-            );
-
-            state = task.execute(state);
-        }
-
         Set<String> entities = requests.stream().map(r -> r.getPolicy().getName()).collect(Collectors.toSet());
-
         Set<String> toDelete = new HashSet<>(prevState.keys());
         toDelete.removeAll(entities);
 
-        for (var policyToDelete : toDelete) {
-            LifecycleMetadataService.DeleteLifecyclePolicyTask task = new LifecycleMetadataService.DeleteLifecyclePolicyTask(
-                state.metadata().getProject(projectId).id(),
-                new DeleteLifecycleAction.Request(
-                    RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
-                    RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
-                    policyToDelete
-                ),
-                ActionListener.noop()
-            );
-            state = task.execute(state);
-        }
+        // PRTODO: Filtered headers. Null safe?
+        ClusterState state = new LifecycleMetadataService.BulkLifecyclePolicyTask(
+            projectId,
+            new LifecycleMetadataService.BulkLifecycleOperation(requests, null, toDelete, false),
+            licenseState,
+            xContentRegistry,
+            client,
+            RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
+            RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
+            ActionListener.noop()
+        ).execute(prevState.state());
 
         return new TransformState(state, entities);
     }
