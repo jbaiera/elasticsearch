@@ -27,7 +27,9 @@ import org.elasticsearch.cluster.project.ProjectResolver;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.cluster.service.MasterServiceTaskQueue;
 import org.elasticsearch.common.Priority;
+import org.elasticsearch.common.util.set.Sets;
 import org.elasticsearch.core.Nullable;
+import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.license.XPackLicenseState;
 import org.elasticsearch.reservedstate.ReservedClusterStateHandler;
@@ -48,14 +50,13 @@ import org.elasticsearch.xpack.ilm.action.ReservedLifecycleAction;
 
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
-import java.util.stream.Collectors;
 
 import static org.elasticsearch.xpack.core.ilm.LifecycleOperationMetadata.currentILMMode;
 import static org.elasticsearch.xpack.core.searchablesnapshots.SearchableSnapshotsConstants.SEARCHABLE_SNAPSHOT_FEATURE;
@@ -66,13 +67,17 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
 
     private static final String BULK_METADATA_SERVICE_NAME = "elasticsearch.xpack.ilm";
 
+    private static final String PUT_SOURCE_PREFIX = "put-lifecycle-";
+    private static final String DELETE_SOURCE_PREFIX = "delete-lifecycle-";
+    private static final String BULK_SOURCE = "bulk-update-lifecycle";
+
     private final ClusterService clusterService;
     private final NamedXContentRegistry xContentRegistry;
     private final Client client;
     private final XPackLicenseState licenseState;
     private final ThreadPool threadPool;
     private final ProjectResolver projectResolver;
-    private final MasterServiceTaskQueue<BulkUpdateLifecyclePolicyTask> taskQueue;
+    private final MasterServiceTaskQueue<BulkLifecyclePolicyTask> taskQueue;
 
     public LifecycleMetadataService(
         ClusterService clusterService,
@@ -108,39 +113,35 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
     }
 
     public static class BulkLifecycleOperation extends BulkMetadataOperation {
-        final List<PutLifecycleRequest> requests;
+        final Collection<PutLifecycleRequest> requests;
         final Map<String, String> filteredHeaders;
-        final List<DeleteLifecycleAction.Request> deleteRequests;
+        final Set<String> deletePolicies;
         final boolean verboseLogging;
 
-        public BulkLifecycleOperation(List<PutLifecycleRequest> requests, boolean verboseLogging) {
-            this(requests, null, verboseLogging);
-        }
-
         public BulkLifecycleOperation(
-            List<PutLifecycleRequest> requests,
+            Collection<PutLifecycleRequest> requests,
             Map<String, String> filteredHeaders,
-            boolean verboseLogging
-        ) {
-            this(requests, filteredHeaders, List.of(), verboseLogging);
-        }
-
-        public BulkLifecycleOperation(
-            List<PutLifecycleRequest> requests,
-            Map<String, String> filteredHeaders,
-            List<DeleteLifecycleAction.Request> deleteRequestsRequests,
+            Set<String> deletePolicies,
             boolean verboseLogging
         ) {
             super(BULK_METADATA_SERVICE_NAME);
             this.requests = requests;
             this.filteredHeaders = filteredHeaders;
-            this.deleteRequests = deleteRequestsRequests;
+            this.deletePolicies = deletePolicies;
             this.verboseLogging = verboseLogging;
+        }
+
+        public static BulkLifecycleOperation singleUpdate(PutLifecycleRequest request, boolean verboseLogging) {
+            return new BulkLifecycleOperation(List.of(request), null, Set.of(), verboseLogging);
+        }
+
+        public static BulkLifecycleOperation singleDelete(String request) {
+            return new BulkLifecycleOperation(List.of(), null, Set.of(request), false);
         }
 
         @Override
         public boolean isEmpty() {
-            return (requests == null || requests.isEmpty()) && (deleteRequests == null || deleteRequests.isEmpty());
+            return (requests == null || requests.isEmpty()) && (deletePolicies == null || deletePolicies.isEmpty());
         }
     }
 
@@ -157,26 +158,32 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
         BulkLifecycleOperation batch,
         ProjectMetadata currentProject
     ) {
-        // headers from the thread context stored by the AuthenticationService to be shared between the
-        // REST layer and the Transport layer here must be accessed within this thread and not in the
-        // cluster state thread in the ClusterStateUpdateTask below since that thread does not share the
-        // same context, and therefore does not have access to the appropriate security headers.
-        Map<String, String> filteredHeaders = ClientHelper.getPersistableSafeSecurityHeaders(
-            threadPool.getThreadContext(),
-            clusterService.state()
-        );
+        // PRTODO: It might be nice to consolidate duplicate removals and remove updates that are destined to be removed anyway
+        // We only need to capture headers and validate on put operations
+        if (batch.requests.isEmpty() == false) {
+            // headers from the thread context stored by the AuthenticationService to be shared between the
+            // REST layer and the Transport layer here must be accessed within this thread and not in the
+            // cluster state thread in the ClusterStateUpdateTask below since that thread does not share the
+            // same context, and therefore does not have access to the appropriate security headers.
+            Map<String, String> filteredHeaders = ClientHelper.getPersistableSafeSecurityHeaders(
+                threadPool.getThreadContext(),
+                clusterService.state()
+            );
 
-        List<PutLifecycleRequest> filteredRequests = new ArrayList<>(batch.requests);
-        IndexLifecycleMetadata lifecycleMetadata = currentProject.custom(IndexLifecycleMetadata.TYPE, IndexLifecycleMetadata.EMPTY);
-        for (PutLifecycleRequest request : batch.requests) {
-            LifecyclePolicyMetadata existingPolicy = lifecycleMetadata.getPolicyMetadatas().get(request.getPolicy().getName());
-            // Skip a request if it is a no-op (if the policy and filtered headers match exactly)
-            if (isNoopUpdate(existingPolicy, request.getPolicy(), filteredHeaders) == false) {
-                filteredRequests.add(request);
+            List<PutLifecycleRequest> filteredRequests = new ArrayList<>(batch.requests);
+            IndexLifecycleMetadata lifecycleMetadata = currentProject.custom(IndexLifecycleMetadata.TYPE, IndexLifecycleMetadata.EMPTY);
+            for (PutLifecycleRequest request : batch.requests) {
+                LifecyclePolicyMetadata existingPolicy = lifecycleMetadata.getPolicyMetadatas().get(request.getPolicy().getName());
+                // Skip a request if it is a no-op (if the policy and filtered headers match exactly)
+                if (isNoopUpdate(existingPolicy, request.getPolicy(), filteredHeaders) == false) {
+                    filteredRequests.add(request);
+                }
             }
+            // Capture the filtered headers on the operation
+            return new BulkLifecycleOperation(filteredRequests, filteredHeaders, batch.deletePolicies, batch.verboseLogging);
+        } else {
+            return batch;
         }
-        // Capture the filtered headers on the operation
-        return new BulkLifecycleOperation(filteredRequests, filteredHeaders, batch.verboseLogging);
     }
 
     @Override
@@ -187,7 +194,7 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
         return doApplyBatch(batch, previousProject, licenseState, xContentRegistry, client);
     }
 
-    private static BulkMetadataOperationContext<Void> doApplyBatch(
+    public static BulkMetadataOperationContext<Void> doApplyBatch(
         BulkLifecycleOperation batch,
         ProjectMetadata previousProject,
         XPackLicenseState licenseState,
@@ -250,14 +257,11 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
             }
         }
 
-        if (batch.deleteRequests.isEmpty() == false) {
-            final Set<String> policiesToDelete = batch.deleteRequests.stream()
-                .map(DeleteLifecycleAction.Request::getPolicyName)
-                .collect(Collectors.toSet());
+        if (batch.deletePolicies.isEmpty() == false) {
             // Most common case will likely be a single delete operation
-            Map<String, List<String>> policiesRequiredByIndices = HashMap.newHashMap(policiesToDelete.size());
+            Map<String, List<String>> policiesRequiredByIndices = HashMap.newHashMap(batch.deletePolicies.size());
             for (IndexMetadata idxMeta : previousProject.indices().values()) {
-                if (idxMeta.getLifecyclePolicyName() != null && policiesToDelete.contains(idxMeta.getLifecyclePolicyName())) {
+                if (idxMeta.getLifecyclePolicyName() != null && batch.deletePolicies.contains(idxMeta.getLifecyclePolicyName())) {
                     String name = idxMeta.getIndex().getName();
                     policiesRequiredByIndices.computeIfAbsent(idxMeta.getLifecyclePolicyName(), k -> new ArrayList<>()).add(name);
                 }
@@ -266,19 +270,19 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
                 throw collectExceptionsForRequiredPolicies(policiesRequiredByIndices);
             }
 
-            for (String policyToDelete : policiesToDelete) {
-                Map<String, LifecyclePolicyMetadata> checkPolicies = newPolicies == null
-                    ? currentMetadata.getPolicyMetadatas()
-                    : newPolicies;
-                if (checkPolicies.containsKey(policyToDelete) == false) {
-                    throw new ResourceNotFoundException("Lifecycle policy not found: {}", policyToDelete);
+            Map<String, LifecyclePolicyMetadata> checkPolicies = newPolicies == null ? currentMetadata.getPolicyMetadatas() : newPolicies;
+            if (checkPolicies.keySet().containsAll(batch.deletePolicies) == false) {
+                Set<String> missingPolicies = Sets.difference(batch.deletePolicies, checkPolicies.keySet());
+                if (missingPolicies.size() == 1) {
+                    throw new ResourceNotFoundException("Lifecycle policy not found: {}", missingPolicies.iterator().next());
+                } else {
+                    throw new ResourceNotFoundException("Lifecycle policies not found: {}", missingPolicies);
                 }
-                policyChanges = true;
-                if (newPolicies == null) {
-                    newPolicies = new TreeMap<>(currentMetadata.getPolicyMetadatas());
-                }
-                newPolicies.remove(policyToDelete);
             }
+            if (newPolicies == null) {
+                newPolicies = new TreeMap<>(currentMetadata.getPolicyMetadatas());
+            }
+            newPolicies.keySet().removeAll(batch.deletePolicies);
         }
 
         if (policyChanges) {
@@ -321,31 +325,23 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
     }
 
     public void addLifecycle(PutLifecycleRequest request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
-        var bulkOp = new BulkLifecycleOperation(List.of(request), true);
-        final ProjectId projectId = projectResolver.getProjectId();
-        ProjectMetadata projectMetadata = state.getMetadata().getProject(projectId);
-        validateBatch(bulkOp, projectMetadata);
-        var finalBulkOp = filterBatch(bulkOp, projectMetadata);
-        if (finalBulkOp.isEmpty()) {
-            return;
-        }
-        var putTask = new LifecycleMetadataService.BulkUpdateLifecyclePolicyTask(request, listener) {
-            @Override
-            public ClusterState execute(ClusterState currentState) throws Exception {
-                var currentMetadata = currentState.getMetadata().getProject(projectId);
-                BulkMetadataOperationContext<Void> ctx = applyBatch(finalBulkOp, currentMetadata);
-                if (ctx == null) {
-                    assert false : "PutLifecycleMetadataService returned null context from applyBatch method.";
-                    return currentState;
-                }
-                if (ctx.getResult() != currentMetadata) {
-                    return ClusterState.builder(currentState).putProjectMetadata(ctx.getResult()).build();
-                } else {
-                    return currentState;
-                }
-            }
-        };
-        taskQueue.submitTask("put-lifecycle-" + request.getPolicy().getName(), putTask, putTask.timeout());
+        bulkLifecycleChange(
+            BulkLifecycleOperation.singleUpdate(request, true),
+            state,
+            request.masterNodeTimeout(),
+            request.ackTimeout(),
+            listener
+        );
+    }
+
+    public void deleteLifecycle(DeleteLifecycleAction.Request request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
+        bulkLifecycleChange(
+            BulkLifecycleOperation.singleDelete(request.getPolicyName()),
+            state,
+            request.masterNodeTimeout(),
+            request.ackTimeout(),
+            listener
+        );
     }
 
     /**
@@ -433,19 +429,86 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
         }
     }
 
-    private abstract static class BulkUpdateLifecyclePolicyTask extends AckedClusterStateUpdateTask {
-        protected BulkUpdateLifecyclePolicyTask(PutLifecycleRequest request, ActionListener<AcknowledgedResponse> listener) {
-            super(request, listener);
+    public void bulkLifecycleChange(
+        BulkLifecycleOperation bulkOp,
+        ClusterState state,
+        TimeValue masterNodeTimeout,
+        TimeValue ackTimeout,
+        ActionListener<AcknowledgedResponse> listener
+    ) {
+        final ProjectId projectId = projectResolver.getProjectId();
+        ProjectMetadata projectMetadata = state.getMetadata().getProject(projectId);
+        validateBatch(bulkOp, projectMetadata);
+        var finalBulkOp = filterBatch(bulkOp, projectMetadata);
+        if (finalBulkOp.isEmpty()) {
+            return;
         }
+        var task = new BulkLifecyclePolicyTask(
+            projectId,
+            finalBulkOp,
+            licenseState,
+            xContentRegistry,
+            client,
+            masterNodeTimeout,
+            ackTimeout,
+            listener
+        );
+        String source;
+        if (bulkOp.requests.size() == 1 && bulkOp.deletePolicies.isEmpty()) {
+            source = PUT_SOURCE_PREFIX + bulkOp.requests.iterator().next().getPolicy().getName();
+        } else if (bulkOp.requests.isEmpty() && bulkOp.deletePolicies.size() == 1) {
+            source = DELETE_SOURCE_PREFIX + bulkOp.deletePolicies.iterator().next();
+        } else {
+            source = BULK_SOURCE;
+        }
+        taskQueue.submitTask(source, task, task.timeout());
+    }
+
+    public static class BulkLifecyclePolicyTask extends AckedClusterStateUpdateTask {
+        private final ProjectId projectId;
+        private final BulkLifecycleOperation bulkOp;
+        private final XPackLicenseState licenseState;
+        private final NamedXContentRegistry xContentRegistry;
+        private final Client client;
+
+        public BulkLifecyclePolicyTask(
+            ProjectId projectId,
+            BulkLifecycleOperation bulkOp,
+            XPackLicenseState licenseState,
+            NamedXContentRegistry xContentRegistry,
+            Client client,
+            TimeValue masterNodeTimeout,
+            TimeValue ackTimeout,
+            ActionListener<AcknowledgedResponse> listener
+        ) {
+            super(Priority.NORMAL, masterNodeTimeout, ackTimeout, listener);
+            this.projectId = projectId;
+            this.bulkOp = bulkOp;
+            this.licenseState = licenseState;
+            this.xContentRegistry = xContentRegistry;
+            this.client = client;
+        }
+
         @Override
-        public abstract ClusterState execute(ClusterState currentState) throws Exception;
+        public ClusterState execute(ClusterState currentState) throws Exception {
+            var currentProject = currentState.getMetadata().getProject(projectId);
+            BulkMetadataOperationContext<Void> ctx = doApplyBatch(bulkOp, currentProject, licenseState, xContentRegistry, client);
+            if (ctx == null) {
+                assert false : "LifecycleMetadataService returned null context from applyBatch method.";
+                return currentState;
+            }
+            if (ctx.getResult() != currentProject) {
+                return ClusterState.builder(currentState).putProjectMetadata(ctx.getResult()).build();
+            } else {
+                return currentState;
+            }
+        }
     }
 
     public static class UpdateLifecyclePolicyTask extends AckedClusterStateUpdateTask {
         private final ProjectId projectId;
         private final PutLifecycleRequest request;
         private final XPackLicenseState licenseState;
-        private final Map<String, String> filteredHeaders;
         private final NamedXContentRegistry xContentRegistry;
         private final Client client;
         private final boolean verboseLogging;
@@ -467,7 +530,6 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
             this.projectId = projectId;
             this.request = request;
             this.licenseState = licenseState;
-            this.filteredHeaders = Collections.emptyMap();
             this.xContentRegistry = xContentRegistry;
             this.client = client;
             this.verboseLogging = false;
@@ -477,7 +539,7 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
         public ClusterState execute(ClusterState currentState) throws Exception {
             var projectMetadata = currentState.getMetadata().getProject(projectId);
             BulkMetadataOperationContext<Void> result = doApplyBatch(
-                new BulkLifecycleOperation(List.of(request), filteredHeaders, verboseLogging),
+                BulkLifecycleOperation.singleUpdate(request, verboseLogging),
                 projectMetadata,
                 licenseState,
                 xContentRegistry,
@@ -491,13 +553,51 @@ public class LifecycleMetadataService implements BulkMetadataService<LifecycleMe
         }
     }
 
-    private static class IlmLifecycleExecutor extends SimpleBatchedAckListenerTaskExecutor<
-        LifecycleMetadataService.BulkUpdateLifecyclePolicyTask> {
+    public static class DeleteLifecyclePolicyTask extends AckedClusterStateUpdateTask {
+        private final ProjectId projectId;
+        private final DeleteLifecycleAction.Request request;
+
+        public DeleteLifecyclePolicyTask(
+            ProjectId projectId,
+            DeleteLifecycleAction.Request request,
+            ActionListener<AcknowledgedResponse> listener
+        ) {
+            super(request, listener);
+            this.projectId = projectId;
+            this.request = request;
+        }
+
         @Override
-        public Tuple<ClusterState, ClusterStateAckListener> executeTask(
-            LifecycleMetadataService.BulkUpdateLifecyclePolicyTask task,
-            ClusterState clusterState
-        )
+        public ClusterState execute(ClusterState currentState) {
+            String policyToDelete = request.getPolicyName();
+            ProjectMetadata projectMetadata = currentState.metadata().getProject(projectId);
+            List<String> indicesUsingPolicy = projectMetadata.indices()
+                .values()
+                .stream()
+                .filter(idxMeta -> policyToDelete.equals(idxMeta.getLifecyclePolicyName()))
+                .map(idxMeta -> idxMeta.getIndex().getName())
+                .toList();
+            if (indicesUsingPolicy.isEmpty() == false) {
+                throw new IllegalArgumentException(
+                    "Cannot delete policy [" + request.getPolicyName() + "]. It is in use by one or more indices: " + indicesUsingPolicy
+                );
+            }
+            IndexLifecycleMetadata currentMetadata = projectMetadata.custom(IndexLifecycleMetadata.TYPE);
+            if (currentMetadata == null || currentMetadata.getPolicyMetadatas().containsKey(request.getPolicyName()) == false) {
+                throw new ResourceNotFoundException("Lifecycle policy not found: {}", request.getPolicyName());
+            }
+            SortedMap<String, LifecyclePolicyMetadata> newPolicies = new TreeMap<>(currentMetadata.getPolicyMetadatas());
+            newPolicies.remove(request.getPolicyName());
+            IndexLifecycleMetadata newMetadata = new IndexLifecycleMetadata(newPolicies, currentILMMode(projectMetadata));
+            ProjectMetadata.Builder newProjectMetadata = ProjectMetadata.builder(projectMetadata)
+                .putCustom(IndexLifecycleMetadata.TYPE, newMetadata);
+            return ClusterState.builder(currentState).putProjectMetadata(newProjectMetadata).build();
+        }
+    }
+
+    private static class IlmLifecycleExecutor extends SimpleBatchedAckListenerTaskExecutor<BulkLifecyclePolicyTask> {
+        @Override
+        public Tuple<ClusterState, ClusterStateAckListener> executeTask(BulkLifecyclePolicyTask task, ClusterState clusterState)
             throws Exception {
             return Tuple.tuple(task.execute(clusterState), task);
         }

@@ -105,7 +105,7 @@ public class ReservedLifecycleAction implements ReservedProjectStateHandler<List
         toDelete.removeAll(entities);
 
         for (var policyToDelete : toDelete) {
-            TransportDeleteLifecycleAction.DeleteLifecyclePolicyTask task = new TransportDeleteLifecycleAction.DeleteLifecyclePolicyTask(
+            LifecycleMetadataService.DeleteLifecyclePolicyTask task = new LifecycleMetadataService.DeleteLifecyclePolicyTask(
                 state.metadata().getProject(projectId).id(),
                 new DeleteLifecycleAction.Request(
                     RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
