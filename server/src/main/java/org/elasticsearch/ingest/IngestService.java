@@ -130,10 +130,10 @@ public class IngestService
 
     public static final String BULK_METADATA_SERVICE_NAME = "elasticsearch.ingest";
     public static final class BulkPipelineOperation extends BulkMetadataOperation {
-        final List<PutPipelineRequest> requests;
-        final List<DeletePipelineRequest> deleteRequests;
+        final Collection<PutPipelineRequest> requests;
+        final Set<String> deleteRequests;
 
-        public BulkPipelineOperation(List<PutPipelineRequest> requests, List<DeletePipelineRequest> deleteRequests) {
+        public BulkPipelineOperation(Collection<PutPipelineRequest> requests, Set<String> deleteRequests) {
             super(BULK_METADATA_SERVICE_NAME);
             this.requests = requests;
             this.deleteRequests = deleteRequests;
@@ -514,7 +514,13 @@ public class IngestService
 
         @Override
         public IngestMetadata execute(IngestMetadata currentIngestMetadata, Collection<IndexMetadata> allIndexMetadata) {
-            return clusterStateBulkUpdatePipelines(currentIngestMetadata, List.of(), List.of(request), allIndexMetadata, Instant::now);
+            return clusterStateBulkUpdatePipelines(
+                currentIngestMetadata,
+                List.of(),
+                Set.of(request.getId()),
+                allIndexMetadata,
+                Instant::now
+            );
         }
     }
 
@@ -633,6 +639,10 @@ public class IngestService
         // pipeline updates before BulkMetadataService was introduced.
         final ProjectMetadata locallyAvailableProject = state.metadata().getProject(currentProject.id());
         // if any of the existing pipelines match the request pipelines -- no need to update that pipeline
+        return doFilterBatch(batch, locallyAvailableProject);
+    }
+
+    public static BulkPipelineOperation doFilterBatch(BulkPipelineOperation batch, ProjectMetadata locallyAvailableProject) {
         return new BulkPipelineOperation(
             batch.requests.stream().filter(request -> isNoOpPipelineUpdate(locallyAvailableProject, request) == false).toList(),
             batch.deleteRequests
@@ -848,7 +858,7 @@ public class IngestService
 
         @Override
         public IngestMetadata execute(IngestMetadata currentIngestMetadata, Collection<IndexMetadata> allIndexMetadata) {
-            return clusterStateBulkUpdatePipelines(currentIngestMetadata, List.of(request), List.of(), allIndexMetadata, instantSource);
+            return clusterStateBulkUpdatePipelines(currentIngestMetadata, List.of(request), Set.of(), allIndexMetadata, instantSource);
         }
     }
 
@@ -946,8 +956,8 @@ public class IngestService
 
     public static IngestMetadata clusterStateBulkUpdatePipelines(
         IngestMetadata currentIngestMetadata,
-        List<PutPipelineRequest> requests,
-        List<DeletePipelineRequest> deleteRequests,
+        Collection<PutPipelineRequest> requests,
+        Set<String> deleteRequests,
         Collection<IndexMetadata> allIndexMetadata,
         InstantSource instantSource
     ) {
@@ -973,15 +983,15 @@ public class IngestService
             // Keep holding off on copying it
             pipelines = currentIngestMetadata.getPipelines();
         }
-        for (DeletePipelineRequest deleteRequest : deleteRequests) {
+        for (String deleteRequest : deleteRequests) {
             Set<String> toRemove = new HashSet<>();
             for (String pipelineKey : pipelines.keySet()) {
-                if (Regex.simpleMatch(deleteRequest.getId(), pipelineKey)) {
+                if (Regex.simpleMatch(deleteRequest, pipelineKey)) {
                     toRemove.add(pipelineKey);
                 }
             }
-            if (toRemove.isEmpty() && Regex.isMatchAllPattern(deleteRequest.getId()) == false) {
-                throw new ResourceNotFoundException("pipeline [{}] is missing", deleteRequest.getId());
+            if (toRemove.isEmpty() && Regex.isMatchAllPattern(deleteRequest) == false) {
+                throw new ResourceNotFoundException("pipeline [{}] is missing", deleteRequest);
             } else if (toRemove.isEmpty()) {
                 continue;
             }
